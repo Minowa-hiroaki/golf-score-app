@@ -398,7 +398,14 @@ with tab1:
                 st.divider()
 
             # ===== ライブ・ゲーム集計（入力しながら途中経過を表示） =====
+            # 保存処理でも参照するため、人数に関わらず既定値を用意しておく
             live_olympic = None
+            medals = {}
+            hcap_games = []
+            raw_hdcp = {n: 0 for n in players}
+            ty_handicaps = {n: 0 for n in players}
+            bg_player_hdcps = None
+            bg_override = None
             st.subheader("📊 現在のゲーム状況（ライブ）")
             st.caption("※ ゲームの種類・得点ルールは上の「🎮 ゲーム設定」で変更できます。")
 
