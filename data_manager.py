@@ -10,6 +10,7 @@
 """
 import json
 import os
+import time
 from datetime import datetime
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -21,6 +22,30 @@ _FILES = {
 
 _engine = None
 _gs_ws = None
+
+# API節約用キャッシュ（key -> (timestamp, value)）。"__all__" はSheets全体。
+_cache = {}
+_CACHE_TTL = 8  # 秒
+
+
+def _gs_read_all():
+    """Google Sheets の app_data 全体を1回の読み取りで取得しキャッシュする。"""
+    now = time.time()
+    c = _cache.get("__all__")
+    if c and now - c[0] < _CACHE_TTL:
+        return c[1]
+    ws = _get_ws()
+    rows = ws.get_all_values()  # [[key, value], ...]（1行目はヘッダ）
+    d = {}
+    for r in rows:
+        if len(r) >= 2 and r[0] and r[0] != "key":
+            d[r[0]] = r[1]
+    _cache["__all__"] = (now, d)
+    return d
+
+
+def clear_cache():
+    _cache.clear()
 
 
 def _db_url():
@@ -92,32 +117,36 @@ def _get_engine():
 
 
 def _load(key, default):
-    """key に対応するJSONを読み込む。"""
+    """key に対応するJSONを読み込む（API節約のためキャッシュ）。"""
     backend = _backend()
+    if backend == "gs":
+        data = _gs_read_all()
+        raw = data.get(key)
+        if raw:
+            try:
+                return json.loads(raw)
+            except Exception:
+                return default
+        return default
     if backend == "pg":
+        now = time.time()
+        c = _cache.get(key)
+        if c and now - c[0] < _CACHE_TTL:
+            return c[1]
         from sqlalchemy import text
         eng = _get_engine()
         with eng.begin() as con:
             row = con.execute(
                 text("SELECT value FROM app_data WHERE key=:k"), {"k": key}
             ).fetchone()
+        val = default
         if row and row[0]:
             try:
-                return json.loads(row[0])
+                val = json.loads(row[0])
             except Exception:
-                return default
-        return default
-    if backend == "gs":
-        ws = _get_ws()
-        keys = ws.col_values(1)
-        if key in keys:
-            val = ws.cell(keys.index(key) + 1, 2).value
-            if val:
-                try:
-                    return json.loads(val)
-                except Exception:
-                    return default
-        return default
+                val = default
+        _cache[key] = (now, val)
+        return val
     # ファイル保存
     os.makedirs(DATA_DIR, exist_ok=True)
     path = _FILES[key]
@@ -134,6 +163,18 @@ def _store(key, value):
     """key に value(JSON可能なオブジェクト) を保存する。"""
     backend = _backend()
     payload = json.dumps(value, ensure_ascii=False)
+    if backend == "gs":
+        ws = _get_ws()
+        keys = ws.col_values(1)
+        if key in keys:
+            ws.update_cell(keys.index(key) + 1, 2, payload)
+        else:
+            ws.append_row([key, payload])
+        # キャッシュを更新（保存直後に再読込しないで済むように）
+        c = _cache.get("__all__")
+        if c:
+            c[1][key] = payload
+        return
     if backend == "pg":
         from sqlalchemy import text
         eng = _get_engine()
@@ -142,14 +183,7 @@ def _store(key, value):
                 "INSERT INTO app_data(key, value) VALUES(:k, :v) "
                 "ON CONFLICT(key) DO UPDATE SET value=:v"
             ), {"k": key, "v": payload})
-        return
-    if backend == "gs":
-        ws = _get_ws()
-        keys = ws.col_values(1)
-        if key in keys:
-            ws.update_cell(keys.index(key) + 1, 2, payload)
-        else:
-            ws.append_row([key, payload])
+        _cache[key] = (time.time(), value)
         return
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(_FILES[key], "w", encoding="utf-8") as f:
