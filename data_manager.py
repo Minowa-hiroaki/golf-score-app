@@ -71,6 +71,8 @@ def _gsheets_conf():
 
 
 def _backend():
+    if os.environ.get("GOLF_BACKEND") == "file":  # テスト用にファイル保存を強制
+        return "file"
     if _db_url():
         return "pg"
     if _gsheets_conf():
