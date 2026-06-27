@@ -1,0 +1,294 @@
+"""データ保存層。
+
+保存先を自動で切り替える（優先順）:
+  1. DB_URL（st.secrets["db_url"] か環境変数 DB_URL）があれば → Postgres(Supabase等)
+  2. Google Sheets の設定があれば → Googleスプレッドシート
+  3. どちらも無ければ → ローカルのJSONファイル（data/*.json）
+
+いずれも "courses" / "rounds" / "prefs" の3つのJSONを丸ごと保存する
+（少人数の個人用途向け）。
+"""
+import json
+import os
+from datetime import datetime
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+_FILES = {
+    "courses": os.path.join(DATA_DIR, "courses.json"),
+    "rounds": os.path.join(DATA_DIR, "rounds.json"),
+    "prefs": os.path.join(DATA_DIR, "prefs.json"),
+}
+
+_engine = None
+_gs_ws = None
+
+
+def _db_url():
+    """DB接続URLを secrets / 環境変数 から取得（無ければ None＝ファイル保存）"""
+    try:
+        import streamlit as st
+        if "db_url" in st.secrets:
+            return st.secrets["db_url"]
+    except Exception:
+        pass
+    return os.environ.get("DB_URL")
+
+
+def _gsheets_conf():
+    """Google Sheets の設定（service accountとシートID）を取得。無ければ None。"""
+    try:
+        import streamlit as st
+        if "gcp_service_account" in st.secrets and "gsheet_id" in st.secrets:
+            return dict(st.secrets["gcp_service_account"]), st.secrets["gsheet_id"]
+    except Exception:
+        pass
+    return None
+
+
+def _backend():
+    if _db_url():
+        return "pg"
+    if _gsheets_conf():
+        return "gs"
+    return "file"
+
+
+def _get_ws():
+    """Google Sheets の app_data ワークシートを返す（無ければ作成）。"""
+    global _gs_ws
+    if _gs_ws is None:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_info, sheet_id = _gsheets_conf()
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(sheet_id)
+        try:
+            ws = sh.worksheet("app_data")
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="app_data", rows=100, cols=2)
+            ws.update("A1:B1", [["key", "value"]])
+        _gs_ws = ws
+    return _gs_ws
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        from sqlalchemy import create_engine
+        url = _db_url()
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+        elif url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        _engine = create_engine(url, pool_pre_ping=True)
+        with _engine.begin() as con:
+            con.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS app_data "
+                "(key TEXT PRIMARY KEY, value TEXT)"
+            )
+    return _engine
+
+
+def _load(key, default):
+    """key に対応するJSONを読み込む。"""
+    backend = _backend()
+    if backend == "pg":
+        from sqlalchemy import text
+        eng = _get_engine()
+        with eng.begin() as con:
+            row = con.execute(
+                text("SELECT value FROM app_data WHERE key=:k"), {"k": key}
+            ).fetchone()
+        if row and row[0]:
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return default
+        return default
+    if backend == "gs":
+        ws = _get_ws()
+        keys = ws.col_values(1)
+        if key in keys:
+            val = ws.cell(keys.index(key) + 1, 2).value
+            if val:
+                try:
+                    return json.loads(val)
+                except Exception:
+                    return default
+        return default
+    # ファイル保存
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = _FILES[key]
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _store(key, value):
+    """key に value(JSON可能なオブジェクト) を保存する。"""
+    backend = _backend()
+    payload = json.dumps(value, ensure_ascii=False)
+    if backend == "pg":
+        from sqlalchemy import text
+        eng = _get_engine()
+        with eng.begin() as con:
+            con.execute(text(
+                "INSERT INTO app_data(key, value) VALUES(:k, :v) "
+                "ON CONFLICT(key) DO UPDATE SET value=:v"
+            ), {"k": key, "v": payload})
+        return
+    if backend == "gs":
+        ws = _get_ws()
+        keys = ws.col_values(1)
+        if key in keys:
+            ws.update_cell(keys.index(key) + 1, 2, payload)
+        else:
+            ws.append_row([key, payload])
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(_FILES[key], "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+
+
+def ensure_data_dir():
+    """互換用（ファイル保存時のみ意味を持つ）。"""
+    if _backend() == "file":
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# ---------- prefs ----------
+def load_prefs():
+    return _load("prefs", {})
+
+
+def save_prefs(prefs):
+    _store("prefs", prefs)
+
+
+def update_prefs(**kwargs):
+    prefs = load_prefs()
+    prefs.update({k: v for k, v in kwargs.items() if v is not None})
+    save_prefs(prefs)
+    return prefs
+
+
+# ---------- courses ----------
+def load_courses():
+    return _load("courses", [])
+
+
+def save_course(course):
+    """コースを保存する。同名コースがあれば上書き、なければ追加する。"""
+    courses = load_courses()
+    replaced = False
+    for i, c in enumerate(courses):
+        if c["name"] == course["name"]:
+            courses[i] = course
+            replaced = True
+            break
+    if not replaced:
+        courses.append(course)
+    _store("courses", courses)
+    return {"course": course, "replaced": replaced}
+
+
+def delete_course(name):
+    courses = [c for c in load_courses() if c["name"] != name]
+    _store("courses", courses)
+
+
+def course_exists(name):
+    return any(c["name"] == name for c in load_courses())
+
+
+# ---------- rounds ----------
+def load_rounds():
+    return _load("rounds", [])
+
+
+def save_round(round_data):
+    rounds = load_rounds()
+    next_id = max([r.get("id", 0) for r in rounds], default=0) + 1
+    round_data["id"] = next_id
+    round_data["created_at"] = datetime.now().isoformat()
+    rounds.append(round_data)
+    _store("rounds", rounds)
+    return round_data
+
+
+def delete_round(round_id):
+    rounds = [r for r in load_rounds() if r.get("id") != round_id]
+    _store("rounds", rounds)
+
+
+def update_round(round_id, **fields):
+    """指定ラウンドにフィールドを追記・更新する（オリンピックの点数保存など）"""
+    rounds = load_rounds()
+    for r in rounds:
+        if r.get("id") == round_id:
+            r.update(fields)
+            break
+    _store("rounds", rounds)
+
+
+# ---------- 集計ヘルパー ----------
+def get_player_stats(player_name):
+    rounds = load_rounds()
+    player_scores = []
+    for r in rounds:
+        for p in r["players"]:
+            if p["name"] == player_name:
+                player_scores.append({
+                    "date": r["date"],
+                    "course": r["course_name"],
+                    "scores": p["scores"],
+                    "total": sum(p["scores"]),
+                })
+    return player_scores
+
+
+def get_hole_averages(player_name):
+    rounds = load_rounds()
+    hole_scores = {}
+    hole_pars = {}
+    for r in rounds:
+        pars = r.get("pars", [])
+        for p in r["players"]:
+            if p["name"] == player_name:
+                for i, score in enumerate(p["scores"]):
+                    hole_num = i + 1
+                    if hole_num not in hole_scores:
+                        hole_scores[hole_num] = []
+                        hole_pars[hole_num] = []
+                    hole_scores[hole_num].append(score)
+                    if i < len(pars):
+                        hole_pars[hole_num].append(pars[i])
+    result = []
+    for hole_num in sorted(hole_scores.keys()):
+        scores = hole_scores[hole_num]
+        pars = hole_pars.get(hole_num, [])
+        avg_par = sum(pars) / len(pars) if pars else 0
+        result.append({
+            "hole": hole_num,
+            "avg_score": round(sum(scores) / len(scores), 1),
+            "min_score": min(scores),
+            "max_score": max(scores),
+            "count": len(scores),
+            "par": round(avg_par, 1) if avg_par else "-",
+        })
+    return result
+
+
+def get_all_player_names():
+    rounds = load_rounds()
+    names = set()
+    for r in rounds:
+        for p in r["players"]:
+            names.add(p["name"])
+    return sorted(names)

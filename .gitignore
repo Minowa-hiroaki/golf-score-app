@@ -1,0 +1,11 @@
+# ローカルデータ（クラウドには上げない）
+data/
+
+# Streamlit secrets（APIキー・DB接続情報。絶対に公開しない）
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
