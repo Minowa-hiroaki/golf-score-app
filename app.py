@@ -150,6 +150,31 @@ st.markdown("""
 
 ensure_data_dir()
 
+# データ保存先への接続診断（エラー内容を画面に表示する）
+try:
+    load_courses()
+except Exception as e:
+    st.error("データ保存先（Googleスプレッドシート等）への接続でエラーが発生しました。")
+    detail = getattr(getattr(e, "response", None), "text", None) or str(e)
+    st.code(detail)
+    info = None
+    try:
+        from data_manager import _gsheets_conf
+        conf = _gsheets_conf()
+        if conf:
+            sa, sid = conf
+            st.caption(
+                f"使用中のサービスアカウント: {sa.get('client_email')}\n"
+                f"プロジェクト: {sa.get('project_id')}\n"
+                f"シートID: {sid}"
+            )
+    except Exception:
+        pass
+    st.info("上のエラー内容と『使用中のサービスアカウント』を確認してください。"
+            "・スプレッドシートをそのアカウントに『編集者』で共有しているか "
+            "・Google Sheets APIが有効か をご確認ください。")
+    st.stop()
+
 st.title("⛳ ゴルフスコア集計")
 
 tab1, tab2, tab5, tab3, tab4 = st.tabs(
