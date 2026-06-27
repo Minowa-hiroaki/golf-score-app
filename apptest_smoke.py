@@ -34,6 +34,23 @@ course = {
 course["total_par"] = sum(course["pars"])
 dm._store("courses", [course])
 
+# 分析タブ描画確認用に、同一コース2ラウンド＋別コース1ラウンドを用意
+import random as _rnd
+_rnd.seed(1)
+dm._store("rounds", [
+    {"id": 1, "date": "2026-01-01", "course_name": "テストCC",
+     "pars": course["pars"], "num_holes": 18,
+     "players": [{"name": "私", "scores": [_rnd.randint(3, 7) for _ in range(18)],
+                  "putts": [2] * 18}]},
+    {"id": 2, "date": "2026-01-08", "course_name": "テストCC",
+     "pars": course["pars"], "num_holes": 18,
+     "players": [{"name": "私", "scores": [_rnd.randint(3, 7) for _ in range(18)],
+                  "putts": [2] * 18}]},
+    {"id": 3, "date": "2026-01-15", "course_name": "別コース",
+     "pars": [4] * 18, "num_holes": 18,
+     "players": [{"name": "私", "scores": [_rnd.randint(3, 7) for _ in range(18)]}]},
+])
+
 from streamlit.testing.v1 import AppTest
 
 PASS, FAIL, BUGS = 0, 0, []
@@ -76,7 +93,23 @@ def click_save(at):
 
 
 print("== AppTest: 起動 ==")
-at0 = run_case("初期起動", lambda at: None)
+at0 = run_case("初期起動（分析タブにデータあり）", lambda at: None)
+
+
+def case_analysis(at):
+    # 集計・分析タブのプレーヤー選択を操作（描画確認）
+    for sb in at.selectbox:
+        if sb.key == "stats_player":
+            sb.set_value("私")
+    at.run()
+    # コース別ホール分析のコース選択
+    for sb in at.selectbox:
+        if sb.key == "course_hole_select":
+            sb.set_value("テストCC")
+    at.run()
+
+
+run_case("分析タブ描画（Par別/内訳/コース別）", case_analysis)
 
 print("== 1人で保存（先のNameError再現確認）==")
 

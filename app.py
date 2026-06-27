@@ -8,6 +8,8 @@ from data_manager import (
     load_courses, save_course, delete_course, load_rounds, save_round,
     delete_round, update_round, get_hole_averages, get_all_player_names,
     ensure_data_dir, load_prefs, update_prefs,
+    get_par_type_stats, get_score_breakdown, get_player_courses,
+    get_course_hole_averages,
 )
 from games import (
     tate_results, yoko_results, olympic_totals, olympic_points_from_medals,
@@ -707,8 +709,6 @@ with tab2:
     else:
         selected_player = st.selectbox("プレーヤーを選択", all_players, key="stats_player")
 
-        hole_avgs = get_hole_averages(selected_player)
-
         # スコア・パットのサマリー
         _rounds = load_rounds()
         _scores, _putts = [], []
@@ -719,119 +719,131 @@ with tab2:
                     pts = p.get("putts") or []
                     if any(pts):
                         _putts.append(sum(pts))
-        if _scores:
+
+        if not _scores:
+            st.info(f"{selected_player} のスコアデータがありません。")
+        else:
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("ラウンド数", f"{len(_scores)}")
             m2.metric("平均スコア", f"{sum(_scores)/len(_scores):.1f}")
             m3.metric("ベストスコア", f"{min(_scores)}")
-            if _putts:
-                m4.metric("平均パット", f"{sum(_putts)/len(_putts):.1f}")
-            else:
-                m4.metric("平均パット", "—")
+            m4.metric("平均パット", f"{sum(_putts)/len(_putts):.1f}" if _putts else "—")
 
-        if hole_avgs:
-            st.subheader(f"{selected_player} のホール別平均スコア")
+            # === Par別分析（コースをまたいでも比較できる）===
+            st.subheader("Par別の傾向（得意・不得意）")
+            st.caption("コースが違っても、Par3/4/5という種類で見れば比較できます。"
+                       "対パーがマイナスほど得意、プラスほど苦手です。")
+            par_stats = get_par_type_stats(selected_player)
+            if par_stats:
+                ps_df = pd.DataFrame([{
+                    "種類": s["label"],
+                    "平均スコア": s["avg_score"],
+                    "対パー": f"{s['vs_par']:+.2f}",
+                    "ホール数": s["count"],
+                } for s in par_stats])
+                st.dataframe(ps_df, use_container_width=True, hide_index=True)
 
-            df = pd.DataFrame(hole_avgs)
-
-            df_display = df.copy()
-            df_display.columns = ["ホール", "平均スコア", "ベスト", "ワースト", "ラウンド数", "Par"]
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-
-            st.subheader("ホール別パフォーマンス")
-
-            fig = go.Figure()
-
-            par_values = []
-            avg_values = []
-            hole_labels = []
-            for h in hole_avgs:
-                hole_labels.append(f"H{h['hole']}")
-                avg_values.append(h["avg_score"])
-                par_values.append(h["par"] if h["par"] != "-" else 0)
-
-            fig.add_trace(go.Bar(
-                x=hole_labels, y=avg_values,
-                name="平均スコア",
-                marker_color=["#ff6b6b" if a > p else "#51cf66" if a < p else "#339af0"
-                               for a, p in zip(avg_values, par_values)],
-                text=[f"{v}" for v in avg_values],
-                textposition="outside",
-            ))
-
-            if any(p > 0 for p in par_values):
-                fig.add_trace(go.Scatter(
-                    x=hole_labels, y=par_values,
-                    name="Par",
-                    mode="lines+markers",
-                    line=dict(color="#868e96", dash="dash"),
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=[s["label"] for s in par_stats],
+                    y=[s["vs_par"] for s in par_stats],
+                    marker_color=["#51cf66" if s["vs_par"] < 0 else
+                                  "#339af0" if s["vs_par"] == 0 else "#ff6b6b"
+                                  for s in par_stats],
+                    text=[f"{s['vs_par']:+.2f}" for s in par_stats],
+                    textposition="outside",
                 ))
+                fig.update_layout(
+                    height=300, margin=dict(l=20, r=20, t=30, b=20),
+                    yaxis_title="対パー（平均）", title="Par種類別 対パー")
+                st.plotly_chart(fig, use_container_width=True)
 
-            fig.update_layout(
-                height=400,
-                margin=dict(l=20, r=20, t=40, b=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                yaxis_title="打数",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                best = min(par_stats, key=lambda s: s["vs_par"])
+                worst = max(par_stats, key=lambda s: s["vs_par"])
+                if best["par"] != worst["par"]:
+                    st.markdown(f"🟢 一番得意: **{best['label']}**（対パー {best['vs_par']:+.2f}）　"
+                                f"🔴 一番苦手: **{worst['label']}**（対パー {worst['vs_par']:+.2f}）")
 
-            st.caption("🟢 Parより良い　🔵 Par通り　🔴 Parより悪い（苦手ホール）")
+            # === スコア内訳 ===
+            st.subheader("スコア内訳")
+            cats, total = get_score_breakdown(selected_player)
+            if total:
+                bd_df = pd.DataFrame([{
+                    "種類": k, "回数": v, "割合": f"{v/total*100:.1f}%"
+                } for k, v in cats.items()])
+                st.dataframe(bd_df, use_container_width=True, hide_index=True)
+                figb = px.pie(values=list(cats.values()), names=list(cats.keys()),
+                              hole=0.4)
+                figb.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
+                st.plotly_chart(figb, use_container_width=True)
 
-            # スコア推移
-            rounds = load_rounds()
+            # === コース別ホール分析（同一コースを複数回プレーした場合のみ意味あり）===
+            st.subheader("コース別のホール分析")
+            pcourses = get_player_courses(selected_player)
+            repeat_courses = {c: n for c, n in pcourses.items() if n >= 2}
+            if not repeat_courses:
+                st.info("ホール別の分析は「同じコースを2回以上」プレーすると表示されます。"
+                        "（コースが違うとH1同士でも別のホールなので比較できないため）")
+            else:
+                csel = st.selectbox(
+                    "コースを選択（2回以上プレーしたコース）",
+                    list(repeat_courses.keys()),
+                    format_func=lambda c: f"{c}（{repeat_courses[c]}回）",
+                    key="course_hole_select")
+                ch_avgs, rcount = get_course_hole_averages(selected_player, csel)
+                st.caption(f"{csel} を {rcount}回プレーした平均（このコース内ならH1同士の比較に意味があります）")
+                if ch_avgs:
+                    labels = [f"H{h['hole']}" for h in ch_avgs]
+                    avgs = [h["avg_score"] for h in ch_avgs]
+                    pars_v = [h["par"] or 0 for h in ch_avgs]
+                    figc = go.Figure()
+                    figc.add_trace(go.Bar(
+                        x=labels, y=avgs, name="平均",
+                        marker_color=["#ff6b6b" if a > p else "#51cf66" if a < p
+                                      else "#339af0" for a, p in zip(avgs, pars_v)],
+                        text=[f"{v}" for v in avgs], textposition="outside"))
+                    figc.add_trace(go.Scatter(
+                        x=labels, y=pars_v, name="Par", mode="lines+markers",
+                        line=dict(color="#868e96", dash="dash")))
+                    figc.update_layout(
+                        height=380, margin=dict(l=20, r=20, t=30, b=20),
+                        legend=dict(orientation="h", y=1.02), yaxis_title="打数")
+                    st.plotly_chart(figc, use_container_width=True)
+                    st.caption("🟢 Parより良い　🔵 Par通り　🔴 Parより悪い")
+
+                    diffs = [{"hole": h["hole"], "diff": round(h["avg_score"] - h["par"], 1),
+                              "avg": h["avg_score"], "par": h["par"]}
+                             for h in ch_avgs if h["par"]]
+                    if diffs:
+                        ds = sorted(diffs, key=lambda x: x["diff"])
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown("**🟢 得意ホール**")
+                            for d in ds[:3]:
+                                st.markdown(f"- H{d['hole']}: 平均{d['avg']} "
+                                            f"(Par{d['par']}, {d['diff']:+})")
+                        with c2:
+                            st.markdown("**🔴 苦手ホール**")
+                            for d in ds[-3:][::-1]:
+                                st.markdown(f"- H{d['hole']}: 平均{d['avg']} "
+                                            f"(Par{d['par']}, {d['diff']:+})")
+
+            # === スコア推移 ===
             player_rounds = []
-            for r in rounds:
+            for r in _rounds:
                 for p in r["players"]:
                     if p["name"] == selected_player:
                         player_rounds.append({
-                            "date": r["date"],
-                            "course": r["course_name"],
-                            "total": sum(p["scores"]),
-                            "par": sum(r.get("pars", [])),
-                        })
-
+                            "date": r["date"], "course": r["course_name"],
+                            "total": sum(p["scores"])})
             if len(player_rounds) > 1:
                 st.subheader("スコア推移")
-                df_rounds = pd.DataFrame(player_rounds)
-                fig2 = px.line(
-                    df_rounds, x="date", y="total",
-                    markers=True,
-                    labels={"date": "日付", "total": "トータルスコア"},
-                    hover_data=["course"],
-                )
+                fig2 = px.line(pd.DataFrame(player_rounds), x="date", y="total",
+                               markers=True,
+                               labels={"date": "日付", "total": "トータルスコア"},
+                               hover_data=["course"])
                 fig2.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20))
                 st.plotly_chart(fig2, use_container_width=True)
-
-            # 得意・苦手ホール
-            st.subheader("得意・苦手ホール TOP3")
-            diffs = []
-            for h in hole_avgs:
-                par = h["par"] if h["par"] != "-" else 0
-                if par > 0:
-                    diffs.append({
-                        "hole": h["hole"],
-                        "diff": round(h["avg_score"] - par, 1),
-                        "avg": h["avg_score"],
-                        "par": par,
-                    })
-
-            if diffs:
-                diffs_sorted = sorted(diffs, key=lambda x: x["diff"])
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.markdown("**🟢 得意ホール**")
-                    for d in diffs_sorted[:3]:
-                        sign = "+" if d["diff"] > 0 else ""
-                        st.markdown(f"- H{d['hole']}: 平均{d['avg']} (Par{d['par']}, {sign}{d['diff']})")
-
-                with col2:
-                    st.markdown("**🔴 苦手ホール**")
-                    for d in diffs_sorted[-3:][::-1]:
-                        sign = "+" if d["diff"] > 0 else ""
-                        st.markdown(f"- H{d['hole']}: 平均{d['avg']} (Par{d['par']}, {sign}{d['diff']})")
-        else:
-            st.info(f"{selected_player} のスコアデータがありません。")
 
 # --- タブ5: ゲーム集計 ---
 with tab5:

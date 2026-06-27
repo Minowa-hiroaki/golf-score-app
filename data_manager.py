@@ -328,3 +328,100 @@ def get_all_player_names():
         for p in r["players"]:
             names.add(p["name"])
     return sorted(names)
+
+
+def _iter_player_holes(player_name):
+    """そのプレーヤーの全ホールを (par, score) で列挙する（全ラウンド横断）。"""
+    for r in load_rounds():
+        pars = r.get("pars", [])
+        for p in r["players"]:
+            if p["name"] == player_name:
+                for i, s in enumerate(p["scores"]):
+                    if i < len(pars) and pars[i]:
+                        yield pars[i], s
+
+
+def get_par_type_stats(player_name):
+    """Par3/4/5 ごとの平均スコア・対パーを集計（コース非依存で意味がある）。"""
+    buckets = {}
+    for par, s in _iter_player_holes(player_name):
+        buckets.setdefault(par, []).append(s)
+    result = []
+    for par in sorted(buckets):
+        scores = buckets[par]
+        avg = sum(scores) / len(scores)
+        result.append({
+            "par": par,
+            "label": f"Par {par}",
+            "avg_score": round(avg, 2),
+            "vs_par": round(avg - par, 2),
+            "count": len(scores),
+        })
+    return result
+
+
+def get_score_breakdown(player_name):
+    """スコアの内訳（バーディ/パー/ボギー…）をカウント。"""
+    cats = {"イーグル以上": 0, "バーディ": 0, "パー": 0,
+            "ボギー": 0, "ダブルボギー": 0, "トリプル以上": 0}
+    total = 0
+    for par, s in _iter_player_holes(player_name):
+        total += 1
+        d = s - par
+        if d <= -2:
+            cats["イーグル以上"] += 1
+        elif d == -1:
+            cats["バーディ"] += 1
+        elif d == 0:
+            cats["パー"] += 1
+        elif d == 1:
+            cats["ボギー"] += 1
+        elif d == 2:
+            cats["ダブルボギー"] += 1
+        else:
+            cats["トリプル以上"] += 1
+    return cats, total
+
+
+def get_player_courses(player_name):
+    """そのプレーヤーがプレーしたコース名とラウンド数。"""
+    counts = {}
+    for r in load_rounds():
+        if any(p["name"] == player_name for p in r["players"]):
+            counts[r["course_name"]] = counts.get(r["course_name"], 0) + 1
+    return counts
+
+
+def get_course_hole_averages(player_name, course_name):
+    """指定コースに限定したホール別平均（同一コースを複数回プレーした時に意味を持つ）。
+    Returns: (per_hole list, round_count)
+    """
+    hole_scores = {}
+    pars_ref = []
+    rcount = 0
+    for r in load_rounds():
+        if r["course_name"] != course_name:
+            continue
+        played = False
+        for p in r["players"]:
+            if p["name"] == player_name:
+                played = True
+                for i, s in enumerate(p["scores"]):
+                    hole_scores.setdefault(i, []).append(s)
+                if not pars_ref:
+                    pars_ref = r.get("pars", [])
+        if played:
+            rcount += 1
+    result = []
+    for i in sorted(hole_scores.keys()):
+        scores = hole_scores[i]
+        par = pars_ref[i] if i < len(pars_ref) else None
+        result.append({
+            "hole": i + 1,
+            "par": par,
+            "avg_score": round(sum(scores) / len(scores), 1),
+            "min_score": min(scores),
+            "max_score": max(scores),
+            "count": len(scores),
+        })
+    return result, rcount
