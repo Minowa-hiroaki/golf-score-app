@@ -463,3 +463,5 @@ def get_course_hole_averages(player_name, course_name):
             "count": len(scores),
         })
     return result, rcount
+
+# redeploy nudge
