@@ -9,7 +9,7 @@ from data_manager import (
     delete_round, update_round, get_hole_averages, get_all_player_names,
     ensure_data_dir, load_prefs, update_prefs,
     get_par_type_stats, get_score_breakdown, get_player_courses,
-    get_course_hole_averages,
+    get_course_hole_averages, get_recent_putt_avg, get_course_score_averages,
 )
 from games import (
     tate_results, yoko_results, olympic_totals, olympic_points_from_medals,
@@ -128,6 +128,24 @@ def number_row(prefix, pi, holes, labels, defaults, minv, maxv):
                 value=defaults[h], key=f"{prefix}_{pi}_{h}",
             ))
     return vals
+
+
+def score_putt_block(pi, holes, pars, record_putts):
+    """各ホールについて、スコア入力の真下にパット入力（記録する場合）を縦に並べる。
+    Returns: (scores list, putts list)。記録しない場合 putts は []。
+    """
+    scores, putts = [], []
+    cols = st.columns(len(holes))
+    for c, h in zip(cols, holes):
+        with c:
+            scores.append(st.number_input(
+                f"H{h+1}(P{pars[h]})", min_value=1, max_value=20,
+                value=pars[h], key=f"score_{pi}_{h}"))
+            if record_putts:
+                putts.append(st.number_input(
+                    "パット", min_value=0, max_value=10, value=2,
+                    key=f"putt_{pi}_{h}"))
+    return scores, putts
 
 st.set_page_config(
     page_title="ゴルフスコア集計",
@@ -316,6 +334,13 @@ with tab1:
                       for k in ["eagle", "birdie", "par", "bogey", "double"]},
         }
 
+        # パット数を記録するか（早い段階で確認）
+        if "record_putts" not in st.session_state:
+            st.session_state["record_putts"] = bool(prefs.get("record_putts", False))
+        record_putts = st.checkbox(
+            "🟢 パット数も記録する", key="record_putts",
+            help="ONにすると、各ホールのスコアのすぐ下にパット入力欄が出ます。")
+
         st.subheader("プレーヤー設定")
         existing_players = get_all_player_names()
 
@@ -357,43 +382,30 @@ with tab1:
             all_scores = {}
             all_putts = {}
 
+            def putt_part(total):
+                return f" / パット {total}" if record_putts else ""
+
             for pi, player_name in enumerate(players):
                 st.markdown(f"**{player_name}**")
-                putt_defaults = [2] * num_holes
 
                 if num_holes == 18:
-                    st.markdown("*スコア OUT (1-9)*")
-                    sc = number_row("score", pi, range(9),
-                                    [f"H{h+1}(P{pars[h]})" for h in range(9)],
-                                    pars, 1, 20)
-                    st.markdown("*スコア IN (10-18)*")
-                    sc += number_row("score", pi, range(9, 18),
-                                     [f"H{h+1}(P{pars[h]})" for h in range(9, 18)],
-                                     pars, 1, 20)
-                    st.caption(f"OUT {sum(sc[:9])} / IN {sum(sc[9:])} / "
-                               f"TOTAL **{sum(sc)}** (Par {sum(pars)})")
-
-                    with st.expander("🟢 パット数を入力", expanded=False):
-                        st.markdown("*パット OUT (1-9)*")
-                        pt = number_row("putt", pi, range(9),
-                                        [f"H{h+1}" for h in range(9)],
-                                        putt_defaults, 0, 10)
-                        st.markdown("*パット IN (10-18)*")
-                        pt += number_row("putt", pi, range(9, 18),
-                                         [f"H{h+1}" for h in range(9, 18)],
-                                         putt_defaults, 0, 10)
-                        st.caption(f"パット合計: **{sum(pt)}**")
+                    st.markdown("*OUT (1-9)*")
+                    so, po = score_putt_block(pi, range(9), pars, record_putts)
+                    st.caption(f"OUT スコア **{sum(so)}**{putt_part(sum(po))}"
+                               f"（Par {sum(pars[:9])}）")
+                    st.markdown("*IN (10-18)*")
+                    si, pi_ = score_putt_block(pi, range(9, 18), pars, record_putts)
+                    st.caption(f"IN スコア **{sum(si)}**{putt_part(sum(pi_))}"
+                               f"（Par {sum(pars[9:])}）")
+                    sc, pt = so + si, po + pi_
+                    st.markdown(f"TOTAL スコア **{sum(sc)}**{putt_part(sum(pt))}"
+                                f"（Par {sum(pars)}）")
                 else:
                     st.markdown("*スコア*")
-                    sc = number_row("score", pi, range(num_holes),
-                                    [f"H{h+1}(P{pars[h]})" for h in range(num_holes)],
-                                    pars, 1, 20)
-                    st.caption(f"TOTAL **{sum(sc)}** (Par {sum(pars)})")
-                    with st.expander("🟢 パット数を入力", expanded=False):
-                        pt = number_row("putt", pi, range(num_holes),
-                                        [f"H{h+1}" for h in range(num_holes)],
-                                        putt_defaults, 0, 10)
-                        st.caption(f"パット合計: **{sum(pt)}**")
+                    sc, pt = score_putt_block(pi, range(num_holes), pars,
+                                              record_putts)
+                    st.markdown(f"TOTAL スコア **{sum(sc)}**{putt_part(sum(pt))}"
+                                f"（Par {sum(pars)}）")
 
                 all_scores[player_name] = sc
                 all_putts[player_name] = pt
@@ -688,7 +700,8 @@ with tab1:
                 save_round(round_data)
                 # 次回のために自分の名前・ティー・やるゲーム・ルール・HDCPを記憶
                 _pref_kwargs = dict(my_name=players[0], last_tee=selected_tee,
-                                    games=games_sel, rules=current_rules)
+                                    games=games_sel, rules=current_rules,
+                                    record_putts=record_putts)
                 if hcap_games and any(raw_hdcp.values()):
                     saved_ph = dict(prefs.get("player_hdcps", {}))
                     saved_ph.update(raw_hdcp)
@@ -723,11 +736,26 @@ with tab2:
         if not _scores:
             st.info(f"{selected_player} のスコアデータがありません。")
         else:
+            putt_avg, putt_n = get_recent_putt_avg(selected_player, 10)
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("ラウンド数", f"{len(_scores)}")
             m2.metric("平均スコア", f"{sum(_scores)/len(_scores):.1f}")
             m3.metric("ベストスコア", f"{min(_scores)}")
-            m4.metric("平均パット", f"{sum(_putts)/len(_putts):.1f}" if _putts else "—")
+            m4.metric("平均パット(直近10R)",
+                      f"{putt_avg}" if putt_avg is not None else "—",
+                      help="パット数を記録したラウンドのみ・直近10回まで")
+            if putt_avg is not None and putt_n < len(_scores):
+                st.caption(f"※ 平均パットはパット記録のある {putt_n}ラウンドで算出"
+                           "（記録なしはノーカウント）")
+
+            # === コース別スコア平均 ===
+            st.subheader("コース別スコア平均")
+            csa = get_course_score_averages(selected_player)
+            if csa:
+                st.dataframe(pd.DataFrame([{
+                    "コース": c["course"], "平均スコア": c["avg"],
+                    "ベスト": c["best"], "ラウンド数": c["count"],
+                } for c in csa]), use_container_width=True, hide_index=True)
 
             # === Par別分析（コースをまたいでも比較できる）===
             st.subheader("Par別の傾向（得意・不得意）")

@@ -392,6 +392,44 @@ def get_player_courses(player_name):
     return counts
 
 
+def get_recent_putt_avg(player_name, n=10):
+    """直近n回（パット記録があるラウンドのみ）の平均パット。
+    Returns: (平均, 件数)。記録が無ければ (None, 0)。
+    """
+    rounds = sorted(load_rounds(),
+                    key=lambda r: (r.get("date", ""), r.get("id", 0)),
+                    reverse=True)
+    vals = []
+    for r in rounds:
+        for p in r["players"]:
+            if p["name"] == player_name:
+                pts = p.get("putts") or []
+                if any(pts):
+                    vals.append(sum(pts))
+    vals = vals[:n]
+    if not vals:
+        return None, 0
+    return round(sum(vals) / len(vals), 1), len(vals)
+
+
+def get_course_score_averages(player_name):
+    """コースごとの平均スコア・ベスト・ラウンド数。"""
+    data = {}
+    for r in load_rounds():
+        for p in r["players"]:
+            if p["name"] == player_name:
+                data.setdefault(r["course_name"], []).append(sum(p["scores"]))
+    result = []
+    for course, totals in data.items():
+        result.append({
+            "course": course,
+            "avg": round(sum(totals) / len(totals), 1),
+            "best": min(totals),
+            "count": len(totals),
+        })
+    return sorted(result, key=lambda x: x["course"])
+
+
 def get_course_hole_averages(player_name, course_name):
     """指定コースに限定したホール別平均（同一コースを複数回プレーした時に意味を持つ）。
     Returns: (per_hole list, round_count)

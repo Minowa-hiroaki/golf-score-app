@@ -123,6 +123,26 @@ def case_1p(at):
 
 run_case("1人・保存", case_1p)
 
+print("== パット記録ON → 各ホール下に入力 → 保存 ==")
+
+
+def case_putts(at):
+    at.text_input(key="player_name_0").set_value("私")
+    at.run()
+    for cb in at.checkbox:
+        if cb.key == "record_putts":
+            cb.set_value(True)
+    at.run()
+    # パット入力欄(putt_0_0..)が存在することを確認
+    putt_keys = [ni.key for ni in at.number_input
+                 if str(ni.key).startswith("putt_0_")]
+    assert len(putt_keys) >= 9, f"パット入力欄が不足: {len(putt_keys)}"
+    click_save(at)
+    at.run()
+
+
+run_case("パット記録ON・保存", case_putts)
+
 print("== 2人 + タテ/ヨコ + ハンデ ==")
 
 
