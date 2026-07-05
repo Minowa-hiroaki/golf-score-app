@@ -26,6 +26,8 @@ _gs_ws = None
 # API節約用キャッシュ（key -> (timestamp, value)）。"__all__" はSheets全体。
 _cache = {}
 _CACHE_TTL = 8  # 秒
+# Googleスプレッドシートは1セル50,000文字が上限。安全マージンを取って分割する。
+_CHUNK_LIMIT = 45000
 
 
 def _gs_read_all():
@@ -46,6 +48,59 @@ def _gs_read_all():
 
 def clear_cache():
     _cache.clear()
+
+
+def _gs_set_cell(ws, keys, key, value):
+    """列Aの key セルに value を書く（無ければ追記）。更新後の keys(列A) を返す。
+    Google Sheets が値を式/数値として解釈しないよう、必ず RAW で書き込む。"""
+    import gspread
+    if key in keys:
+        row = keys.index(key) + 1
+        ws.update_cells([gspread.Cell(row, 2, value)], value_input_option="RAW")
+    else:
+        ws.append_row([key, value], value_input_option="RAW")
+        keys = keys + [key]
+    return keys
+
+
+def _gs_write(ws, key, payload):
+    """payload を app_data に保存する。1セル上限(_CHUNK_LIMIT)を超える場合は
+    key / key__0 / key__1 ... に分割し、key セルに分割マニフェストを置く。
+    書き込んだ {セルキー: 値} を返す（キャッシュ更新用）。"""
+    keys = ws.col_values(1)
+    updates = {}
+
+    # 既存のチャンク数を把握（縮小時に余りを空にするため）
+    old_n = 0
+    while f"{key}__{old_n}" in keys:
+        old_n += 1
+
+    if len(payload) <= _CHUNK_LIMIT:
+        # 通常保存（値そのものをJSON配列/オブジェクトとして格納）
+        keys = _gs_set_cell(ws, keys, key, payload)
+        updates[key] = payload
+        new_n = 0
+    else:
+        # 分割保存：key にマニフェスト、key__i に本体の断片（文字列を単純分割）
+        chunks = [payload[i:i + _CHUNK_LIMIT]
+                  for i in range(0, len(payload), _CHUNK_LIMIT)]
+        manifest = json.dumps({"__chunked__": True, "n": len(chunks)},
+                              ensure_ascii=False)
+        keys = _gs_set_cell(ws, keys, key, manifest)
+        updates[key] = manifest
+        for i, ch in enumerate(chunks):
+            ck = f"{key}__{i}"
+            keys = _gs_set_cell(ws, keys, ck, ch)
+            updates[ck] = ch
+        new_n = len(chunks)
+
+    # チャンク数が減った場合、余ったチャンクセルを空にする（行は残すが値を消す）
+    for i in range(new_n, old_n):
+        ck = f"{key}__{i}"
+        if ck in keys:
+            keys = _gs_set_cell(ws, keys, ck, "")
+            updates[ck] = ""
+    return updates
 
 
 def _db_url():
@@ -124,12 +179,22 @@ def _load(key, default):
     if backend == "gs":
         data = _gs_read_all()
         raw = data.get(key)
-        if raw:
+        if not raw:
+            return default
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return default
+        # 分割保存されていれば断片を結合して復元。
+        # 後方互換: 通常の値(list等)や旧単一セル形式はそのまま返す。
+        if isinstance(obj, dict) and obj.get("__chunked__"):
+            n = int(obj.get("n", 0))
+            parts = [data.get(f"{key}__{i}", "") for i in range(n)]
             try:
-                return json.loads(raw)
+                return json.loads("".join(parts))
             except Exception:
                 return default
-        return default
+        return obj
     if backend == "pg":
         now = time.time()
         c = _cache.get(key)
@@ -167,15 +232,11 @@ def _store(key, value):
     payload = json.dumps(value, ensure_ascii=False)
     if backend == "gs":
         ws = _get_ws()
-        keys = ws.col_values(1)
-        if key in keys:
-            ws.update_cell(keys.index(key) + 1, 2, payload)
-        else:
-            ws.append_row([key, payload])
+        updates = _gs_write(ws, key, payload)
         # キャッシュを更新（保存直後に再読込しないで済むように）
         c = _cache.get("__all__")
         if c:
-            c[1][key] = payload
+            c[1].update(updates)
         return
     if backend == "pg":
         from sqlalchemy import text
