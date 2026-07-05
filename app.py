@@ -225,9 +225,9 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
         "OpenAI API キー", value=default_key, type="password", key="ocr_api_key",
         help="環境変数 OPENAI_API_KEY や .streamlit/secrets.toml でも設定できます。"
              "設定済みなら空欄のままでOK。")
-    model = st.selectbox("モデル", ["gpt-4o", "gpt-4o-mini", "gpt-5.5"],
+    model = st.selectbox("モデル", ["gpt-5.5", "gpt-4o", "gpt-4o-mini"],
                          index=0, key="ocr_model",
-                         help="この画面は規則的なので gpt-4o が安定。")
+                         help="既定は gpt-5.5。空返り等でうまく読めない時は gpt-4o に切替。")
 
     st.caption("OUT（1-9）とIN（10-18）は別画面です。撮った方をアップロード/撮影してください。"
                "途中まででも読み込めます（残りは下の表で手入力）。")
