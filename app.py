@@ -217,8 +217,8 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
     ss = st.session_state
     ss.setdefault("ocr_ver", 0)
     ss.setdefault("ocr_scores", [None] * 18)   # 18穴バッファ（int or None）
-    ss.setdefault("ocr_halves", {})            # {"OUT":{name_raw:scores9}, "IN":{...}}
-    ss.setdefault("ocr_names", [])             # 検出された name_raw 一覧
+    ss.setdefault("ocr_halves", {})            # {"OUT":{names:[...],scores:[[..],..],detected}, "IN":{...}}
+    ss.setdefault("ocr_names", [])             # 基準ハーフ(名前が多い方)の name_raw 一覧（列順）
 
     default_key = _ocr_api_key()
     api_key = st.text_input(
@@ -257,8 +257,10 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
         elif not any(b for _, b in imgs):
             st.warning("OUTまたはINの画像を1枚以上アップロード/撮影してください。")
         else:
-            halves, names, pars_seen = {}, [], {}
+            halves = {}
             errors = []
+            # 枠(OUT/IN)を正として列順のまま保存する。氏名一致に頼らないので、
+            # IN画面に氏名ヘッダが写っていなくても列位置で後から突き合わせられる。
             for expect_half, b in imgs:
                 if not b:
                     continue
@@ -267,18 +269,21 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
                 except Exception as e:
                     errors.append(f"{expect_half}: 読み取りエラー {e}")
                     continue
-                half = ocr_score.which_half(data) or expect_half
-                pmap = {}
-                for p in data.get("players", []):
-                    nm = p.get("name_raw", "")
-                    if nm and nm not in names:
-                        names.append(nm)
-                    pmap[nm] = p.get("scores") or []
-                halves[half] = pmap
-                if data.get("hole_pars"):
-                    pars_seen[half] = data["hole_pars"]
+                players = data.get("players", []) or []
+                halves[expect_half] = {
+                    "names": [(p.get("name_raw") or "").strip() for p in players],
+                    "scores": [p.get("scores") or [] for p in players],
+                    "detected": ocr_score.which_half(data),  # デバッグ用（枠と食い違えば要確認）
+                }
+            # 基準ハーフ = (氏名数→列数) が最大の方（通常OUT）。列の並びと選択肢の氏名に使う。
+            # 氏名が全く読めない画面でも列数で選び、空名は後で「プレーヤーN」表示にする。
+            ref_names, ref_key = [], (-1, -1)
+            for hp in halves.values():
+                key = (len([n for n in hp["names"] if n]), len(hp["names"]))
+                if key > ref_key:
+                    ref_key, ref_names = key, hp["names"]
             ss.ocr_halves = halves
-            ss.ocr_names = names
+            ss.ocr_names = ref_names
             ss.ocr_ver += 1
             for e in errors:
                 st.error(e)
@@ -289,7 +294,20 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
     if not ss.ocr_names:
         return
 
-    # プレーヤー選択（氏名自動一致で自分を既定に）
+    # 読み取りデバッグ（画像ごとの生結果）— OUT/INが合わない時の原因切り分け用
+    with st.expander("🔧 読み取りデバッグ（画像ごとの生結果）", expanded=False):
+        for h, hp in ss.ocr_halves.items():
+            det = hp.get("detected")
+            warn = "" if (det is None or det == h) else f"　⚠ 検出={det}（枠と不一致）"
+            st.markdown(f"**{h}枠**{warn}")
+            rows = list(zip(hp["names"], hp["scores"]))
+            if not rows:
+                st.caption("　プレーヤーを検出できませんでした。")
+            for i, (n, s) in enumerate(rows):
+                st.text(f"  列{i+1}: 名前='{n}'  scores={s}")
+
+    # プレーヤー選択（氏名自動一致で自分を既定に）。氏名が無い列は「プレーヤーN」表示。
+    disp = [(n if n else f"プレーヤー{i+1}") for i, n in enumerate(ss.ocr_names)]
     prefs_name = (load_prefs() or {}).get("my_name")
     auto_idx = 0
     for i, nm in enumerate(ss.ocr_names):
@@ -297,24 +315,28 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
         if canon and (canon == prefs_name or canon == "hiroaki minowa"):
             auto_idx = i
             break
-    pick = st.selectbox("登録するプレーヤー", ss.ocr_names, index=auto_idx,
-                        key=f"ocr_pick_{ss.ocr_ver}")
+    pick_idx = st.selectbox("登録するプレーヤー", list(range(len(disp))),
+                            index=auto_idx, format_func=lambda i: disp[i],
+                            key=f"ocr_pick_{ss.ocr_ver}")
+    pick = ss.ocr_names[pick_idx]        # 生の表示名（名寄せ・保存名に使う）
     canon = ocr_score.normalize_name(pick)
-    save_name = canon or pick
+    save_name = canon or (pick if pick else disp[pick_idx])
     if canon:
-        st.caption(f"氏名一致：『{pick}』→ {canon}")
+        st.caption(f"氏名一致：『{disp[pick_idx]}』→ {canon}")
     else:
-        st.caption(f"『{pick}』は既知の別名に未登録。この表示名のまま保存します。")
+        st.caption(f"『{disp[pick_idx]}』は既知の別名に未登録。この表示名のまま保存します。")
 
-    # 選択プレーヤーのOUT/INを18穴バッファへ流し込み（既存の手入力は温存）
+    # 選択プレーヤーのOUT/INを18穴バッファへ流し込み（既存の手入力は温存）。
+    # 各ハーフとも「氏名一致→列位置(pick_idx)」で対応列を決める（match_player_scores）。
     buf = list(ss.ocr_scores)
-    if all(v is None for v in buf) or ss.get("ocr_last_pick") != f"{ss.ocr_ver}:{pick}":
+    if all(v is None for v in buf) or ss.get("ocr_last_pick") != f"{ss.ocr_ver}:{pick_idx}":
         buf = [None] * 18
-        for half, pmap in ss.ocr_halves.items():
-            sc = pmap.get(pick) or []
+        for half, hp in ss.ocr_halves.items():
+            sc = ocr_score.match_player_scores(hp["names"], hp["scores"],
+                                               pick, pick_idx)
             ocr_score.merge_half_into(buf, half, sc)
         ss.ocr_scores = buf
-        ss.ocr_last_pick = f"{ss.ocr_ver}:{pick}"
+        ss.ocr_last_pick = f"{ss.ocr_ver}:{pick_idx}"
 
     # 検算表示
     read = ss.ocr_scores

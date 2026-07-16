@@ -42,6 +42,44 @@ def normalize_name(name_raw: str) -> str | None:
     return None
 
 
+def _nospace(s):
+    return (s or "").strip().replace("　", " ").replace(" ", "")
+
+
+def match_player_scores(names, scores_list, pick_name, pick_idx):
+    """このハーフの (names, scores_list) から選択プレーヤーのスコア9個を返す。
+    OUT画面とIN画面は別々にOCRするため、IN画面に氏名ヘッダが写っていないと
+    氏名一致では拾えない。そこで次の優先順で対応列を決める:
+      1. 表示名の完全一致
+      2. 名寄せ後(normalize_name)の一致
+      3. 姓の部分一致（全角/半角空白・敬称ゆれを吸収）
+      4. 列位置(pick_idx)フォールバック ← 氏名が無い/読めない画面はこれで拾う
+    どれも当たらなければ []（＝このハーフは空扱い）。"""
+    names = names or []
+    scores_list = scores_list or []
+    # 1. 完全一致
+    for nm, sc in zip(names, scores_list):
+        if nm and nm == pick_name:
+            return sc or []
+    # 2. 名寄せ一致
+    pc = normalize_name(pick_name)
+    if pc:
+        for nm, sc in zip(names, scores_list):
+            if nm and normalize_name(nm) == pc:
+                return sc or []
+    # 3. 姓の部分一致
+    pk = _nospace(pick_name)
+    if pk:
+        for nm, sc in zip(names, scores_list):
+            n2 = _nospace(nm)
+            if n2 and (n2 in pk or pk in n2):
+                return sc or []
+    # 4. 列位置フォールバック
+    if 0 <= pick_idx < len(scores_list):
+        return scores_list[pick_idx] or []
+    return []
+
+
 # ---- Vision へ渡すプロンプト（この端末レイアウト前提）----
 VISION_PROMPT = """あなたはゴルフ場のタッチパネル・スコア画面を読むOCRです。
 この画像には最大4人分のスコアが行で並び、上部に "OUT" または "IN" と "No.x PARx" が表示されています。
