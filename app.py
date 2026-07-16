@@ -290,6 +290,14 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
     if not ss.ocr_names:
         return
 
+    # OUT/INで検出したプレーヤー列数が食い違うと、氏名の無いハーフは列位置がずれる
+    # （例: 片方だけPT列を1人と誤検出）。気付けるよう警告する。
+    counts = {h: len(hp["scores"]) for h, hp in ss.ocr_halves.items()}
+    if len(set(counts.values())) > 1:
+        st.warning(f"OUT/INで検出したプレーヤー列数が違います {counts}。"
+                   "氏名の無いハーフは列位置がずれる可能性があります。"
+                   "下の🔧デバッグで各列を確認し、必要なら下の表で手修正してください。")
+
     # 読み取りデバッグ（画像ごとの生結果）— OUT/INが合わない時の原因切り分け用
     with st.expander("🔧 読み取りデバッグ（画像ごとの生結果）", expanded=False):
         for h, hp in ss.ocr_halves.items():
