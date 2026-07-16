@@ -229,48 +229,53 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
                          index=0, key="ocr_model",
                          help="既定は gpt-5.5。空返り等でうまく読めない時は gpt-4o に切替。")
 
-    st.caption("OUT（1-9）とIN（10-18）は別画面です。各ナインの画像をアップロードしてください。"
-               "途中まででも読み込めます（残りは下の表で手入力）。")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**OUT（1-9）画像**")
-        out_up = st.file_uploader("アップロード", type=["jpg", "jpeg", "png"],
-                                  key="ocr_out_up", label_visibility="collapsed")
-    with c2:
-        st.markdown("**IN（10-18）画像**")
-        in_up = st.file_uploader("アップロード", type=["jpg", "jpeg", "png"],
-                                 key="ocr_in_up", label_visibility="collapsed")
+    st.caption("スコア確認画面の画像をアップロードしてください（OUT/INをまとめて選択可・自動判別）。"
+               "1枚だけでも読めます（残りは下の表で手入力）。")
+    ups = st.file_uploader("スコア画像（1〜2枚）", type=["jpg", "jpeg", "png"],
+                           accept_multiple_files=True, key="ocr_ups")
 
     def _bytes(x):
         return x.getvalue() if x is not None else None
 
-    imgs = [("OUT", _bytes(out_up)),
-            ("IN", _bytes(in_up))]
+    imgs = [_bytes(u) for u in (ups or []) if u is not None]
 
     if st.button("🔍 画像を読み取る", key="ocr_run"):
         if not (api_key or "").strip():
             st.warning("APIキーが未設定です（環境変数/secrets/この欄のいずれか）。")
-        elif not any(b for _, b in imgs):
-            st.warning("OUTまたはINの画像を1枚以上アップロード/撮影してください。")
+        elif not imgs:
+            st.warning("スコア画像を1枚以上アップロードしてください。")
         else:
-            halves = {}
             errors = []
-            # 枠(OUT/IN)を正として列順のまま保存する。氏名一致に頼らないので、
-            # IN画面に氏名ヘッダが写っていなくても列位置で後から突き合わせられる。
-            for expect_half, b in imgs:
+            # 各画像をOCRし、OUT/INは half 表示・ホール番号(which_half)で自動判別する。
+            parsed = []
+            for b in imgs:
                 if not b:
                     continue
                 try:
                     data = ocr_score.ocr_screen(b, api_key, model=model)
                 except Exception as e:
-                    errors.append(f"{expect_half}: 読み取りエラー {e}")
+                    errors.append(f"読み取りエラー {e}")
                     continue
+                parsed.append((data, ocr_score.which_half(data)))
+
+            def _mk(data, det):
                 players = data.get("players", []) or []
-                halves[expect_half] = {
+                return {
                     "names": [(p.get("name_raw") or "").strip() for p in players],
                     "scores": [p.get("scores") or [] for p in players],
-                    "detected": ocr_score.which_half(data),  # デバッグ用（枠と食い違えば要確認）
+                    "detected": det,
                 }
+            # 1周目: 判別できた画像を該当枠へ / 2周目: 残りを空き枠(OUT→IN)へ
+            halves, leftover = {}, []
+            for data, det in parsed:
+                if det in ("OUT", "IN") and det not in halves:
+                    halves[det] = _mk(data, det)
+                else:
+                    leftover.append((data, det))
+            free = [h for h in ("OUT", "IN") if h not in halves]
+            for (data, det), h in zip(leftover, free):
+                halves[h] = _mk(data, det)
+
             # 基準ハーフ = (氏名数→列数) が最大の方（通常OUT）。列の並びと選択肢の氏名に使う。
             # 氏名が全く読めない画面でも列数で選び、空名は後で「プレーヤーN」表示にする。
             ref_names, ref_key = [], (-1, -1)
@@ -284,7 +289,7 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
             for e in errors:
                 st.error(e)
             if halves:
-                st.success(f"読み取り完了：{ '・'.join(halves.keys()) }。"
+                st.success(f"読み取り完了：{ '・'.join(halves.keys()) }（自動判別）。"
                            "下でプレーヤーを選び、内容を確認してください。")
 
     if not ss.ocr_names:
@@ -439,16 +444,21 @@ with tab1:
         course_hdcps = selected_course.get("hdcps") or []
         course_tees = selected_course.get("tees") or []
 
-        # ティー選択：初期はRegular、以降は前回保存したティーを記憶
+        # ティー選択：どのコースも初期はRegular（あれば）。無ければ前回ティー→先頭。
         selected_tee = None
         tee_yards = []
         if course_tees:
-            desired = prefs.get("last_tee") or "Regular"
-            if ("tee_select" not in st.session_state
+            reg = next((t for t in course_tees
+                        if t.strip().lower() in ("regular", "レギュラー")), None)
+            desired = reg or prefs.get("last_tee") or course_tees[0]
+            course_changed = (st.session_state.get("_tee_course")
+                              != selected_course_name)
+            if (course_changed or "tee_select" not in st.session_state
                     or st.session_state.get("tee_select") not in course_tees):
                 st.session_state["tee_select"] = (
                     desired if desired in course_tees else course_tees[0]
                 )
+            st.session_state["_tee_course"] = selected_course_name
             selected_tee = st.selectbox("ティー", course_tees, key="tee_select")
             tee_yards = selected_course["yards"].get(selected_tee, [])
 
