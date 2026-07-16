@@ -229,27 +229,23 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
                          index=0, key="ocr_model",
                          help="既定は gpt-5.5。空返り等でうまく読めない時は gpt-4o に切替。")
 
-    st.caption("OUT（1-9）とIN（10-18）は別画面です。撮った方をアップロード/撮影してください。"
+    st.caption("OUT（1-9）とIN（10-18）は別画面です。各ナインの画像をアップロードしてください。"
                "途中まででも読み込めます（残りは下の表で手入力）。")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**OUT（1-9）画像**")
         out_up = st.file_uploader("アップロード", type=["jpg", "jpeg", "png"],
                                   key="ocr_out_up", label_visibility="collapsed")
-        out_cam = st.camera_input("撮影", key="ocr_out_cam",
-                                  label_visibility="collapsed")
     with c2:
         st.markdown("**IN（10-18）画像**")
         in_up = st.file_uploader("アップロード", type=["jpg", "jpeg", "png"],
                                  key="ocr_in_up", label_visibility="collapsed")
-        in_cam = st.camera_input("撮影", key="ocr_in_cam",
-                                 label_visibility="collapsed")
 
     def _bytes(x):
         return x.getvalue() if x is not None else None
 
-    imgs = [("OUT", _bytes(out_cam) or _bytes(out_up)),
-            ("IN", _bytes(in_cam) or _bytes(in_up))]
+    imgs = [("OUT", _bytes(out_up)),
+            ("IN", _bytes(in_up))]
 
     if st.button("🔍 画像を読み取る", key="ocr_run"):
         if not (api_key or "").strip():
@@ -353,7 +349,7 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
         "スコア": [None if s is None else int(s) for s in read],
     }, index=[f"H{i+1}" for i in range(18)])
     edited = st.data_editor(
-        df, key=f"ocr_editor_{ss.ocr_ver}", use_container_width=True,
+        df, key=f"ocr_editor_{ss.ocr_ver}_{pick_idx}", use_container_width=True,
         column_config={
             "Par": st.column_config.NumberColumn("Par", disabled=True),
             "スコア": st.column_config.NumberColumn("スコア", min_value=1,
@@ -389,12 +385,12 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
             "players": [{"name": save_name, "scores": final_scores, "putts": []}],
         }
         save_round(round_data)
-        # バッファをクリア
+        # 読み取り結果(halves/names)は保持し、同じ画像から別プレーヤーを続けて
+        # 登録できるようにする。編集バッファだけ空にし、次に選んだ人で再マージさせる。
         ss.ocr_scores = [None] * 18
-        ss.ocr_halves = {}
-        ss.ocr_names = []
-        ss.ocr_ver += 1
-        st.success(f"保存しました：{save_name} {course_name} 合計{sum(final_scores)}")
+        ss.pop("ocr_last_pick", None)
+        st.success(f"保存しました：{save_name} {course_name} 合計{sum(final_scores)}。"
+                   "上の「登録するプレーヤー」で別の人を選べば続けて登録できます。")
         st.balloons()
 
 

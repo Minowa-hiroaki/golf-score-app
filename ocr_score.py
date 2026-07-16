@@ -20,6 +20,8 @@ NAME_ALIASES = {
     "蓑輪 宏晃": "hiroaki minowa",
     "蓑輪宏晃": "hiroaki minowa",
     "蓑輪": "hiroaki minowa",
+    # 「蓑」は難読でVisionが誤読しやすい（実測: 蓑輪→義輪）。既知の誤読を吸収する。
+    "義輪": "hiroaki minowa",
     "みのわ": "hiroaki minowa",
     "hiroaki minowa": "hiroaki minowa",
 }
