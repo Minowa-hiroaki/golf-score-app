@@ -315,6 +315,61 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
             for i, (n, s) in enumerate(rows):
                 st.text(f"  列{i+1}: 名前='{n}'  scores={s}")
 
+    # ===== 全員をライブ入力フォームへ取り込む（途中経過・ゲーム状況を見る）=====
+    st.markdown("**▼ ラウンド途中でも使えます**")
+    st.caption("読み取った全員のスコアを下の入力フォームに取り込み、続きのホールをこのアプリで"
+               "入力できます。取り込むと「📊 現在のゲーム状況（ライブ）」にラスベガス等の"
+               "途中経過が出ます（スルー＝消化ホール数は自動設定）。")
+    if st.button("▶ 全員をライブ入力に取り込んで続ける", key=f"ocr_to_live_{ss.ocr_ver}"):
+        ref = ss.ocr_names
+        n_cols = min(max((len(hp["scores"]) for hp in ss.ocr_halves.values()),
+                         default=0), 4)
+        # 各列(プレーヤー)の18穴スコアを OUT/IN から組み立てる
+        cols_scores = []
+        for j in range(n_cols):
+            nm = ref[j] if j < len(ref) else ""
+            s18 = [None] * 18
+            for half, hp in ss.ocr_halves.items():
+                sc = ocr_score.match_player_scores(hp["names"], hp["scores"], nm, j)
+                ocr_score.merge_half_into(s18, half, sc)
+            cols_scores.append((nm, s18))
+        # 自分(hiroaki minowa)の列を先頭スロットへ
+        my_name = (load_prefs() or {}).get("my_name") or "hiroaki minowa"
+
+        def _is_me(nm):
+            c = ocr_score.normalize_name(nm)
+            return c is not None and c in (my_name, "hiroaki minowa")
+        order = sorted(range(len(cols_scores)),
+                       key=lambda j: (0 if _is_me(cols_scores[j][0]) else 1, j))
+        roster = [cols_scores[j] for j in order]
+        # スルー = 最後に埋まっているホール+1（途中でも可）
+        filled = [h for _, s in roster for h in range(18) if isinstance(s[h], int)]
+        through = (max(filled) + 1) if filled else 18
+        # ライブ入力フォームの各ウィジェットを session_state で prefill する
+        existing = set(get_all_player_names())
+        st.session_state["num_players"] = len(roster) or 1
+        for pi, (nm, s18) in enumerate(roster):
+            canon = ocr_score.normalize_name(nm)
+            disp_name = canon or nm or f"プレーヤー{pi+1}"
+            if pi == 0:
+                st.session_state["player_name_0"] = disp_name
+            elif disp_name in existing:
+                st.session_state[f"player_pick_{pi}"] = disp_name
+            else:
+                st.session_state[f"player_pick_{pi}"] = "＋ 新しい名前を入力"
+                st.session_state[f"player_name_{pi}"] = disp_name
+            for h in range(18):
+                v = s18[h]
+                st.session_state[f"score_{pi}_{h}"] = (
+                    int(v) if isinstance(v, int) else int(course_pars[h]))
+        st.session_state["live_through"] = min(max(through, 1), 18)
+        ss.ocr_imported_msg = (
+            f"{len(roster)}人・{through}ホールまでを下の入力フォームに取り込みました。"
+            "続きのホールを入力し、「📊 現在のゲーム状況（ライブ）」で途中経過を確認できます。")
+        st.rerun()
+
+    st.divider()
+
     # プレーヤー選択（氏名自動一致で自分を既定に）。氏名が無い列は「プレーヤーN」表示。
     disp = [(n if n else f"プレーヤー{i+1}") for i, n in enumerate(ss.ocr_names)]
     prefs_name = (load_prefs() or {}).get("my_name")
@@ -475,6 +530,9 @@ with tab1:
             with st.expander("📷 画像から入力（スコア画面を撮影/アップロード）"):
                 _render_image_ocr(selected_course_name, pars, course_hdcps,
                                   selected_tee, tee_yards, play_date)
+        _imp = st.session_state.pop("ocr_imported_msg", None)
+        if _imp:
+            st.success(_imp)
 
         # ===== ゲーム設定（コース選択の近く） =====
         st.subheader("🎮 ゲーム設定")
@@ -569,7 +627,8 @@ with tab1:
         if "player_name_0" not in st.session_state:
             st.session_state["player_name_0"] = prefs.get("my_name", "")
 
-        num_players = st.radio("プレーヤー数", [1, 2, 3, 4], horizontal=True)
+        num_players = st.radio("プレーヤー数", [1, 2, 3, 4], horizontal=True,
+                               key="num_players")
 
         NEW_OPT = "＋ 新しい名前を入力"
         # 既存プレーヤーは あいうえお順（かな優先）に並べる

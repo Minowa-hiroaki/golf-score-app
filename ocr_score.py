@@ -5,10 +5,12 @@
   - OUT/INを判別し、18ホールの器に流し込む（途中撮影＝残り穴は空のまま）。
   - HALF/TOTAL検算、氏名の名寄せを行う。
 
-現状: Vision呼び出し(_call_vision)はプレースホルダ。名刺アプリと同じクライアントに
-      差し替えれば動く（APIキーの環境変数名が確定したら _make_client を実装）。
-      それまでは parse_vision_json / merge_into_round / verify_half などの
-      純ロジックは単体で使える・テストできる。
+現状: Vision呼び出し(_call_vision)は実装済み。OpenAI公式クライアント(openai>=1.30)を
+      使い、response_format=json_object・モデル別リトライ（gpt-5系は
+      max_completion_tokens/reasoning_effort、旧モデルは max_tokens）で呼ぶ。
+      APIキーは環境変数 OPENAI_API_KEY → st.secrets → 画面入力 の順で解決する。
+      parse_vision_json / merge_into_round / verify_half などの純ロジックは
+      API呼び出し無しで単体でも使える・テストできる。
 """
 from __future__ import annotations
 import json
