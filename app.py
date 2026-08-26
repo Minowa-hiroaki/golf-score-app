@@ -3,19 +3,23 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import date
+from datetime import date, datetime
 from data_manager import (
     load_courses, save_course, delete_course, load_rounds, save_round,
     delete_round, update_round, get_hole_averages, get_all_player_names,
     ensure_data_dir, load_prefs, update_prefs,
     get_par_type_stats, get_score_breakdown, get_player_courses,
     get_course_hole_averages, get_recent_putt_avg, get_course_score_averages,
+    rename_player, player_round_counts, player_rounds_of, forget_player,
 )
 from games import (
     tate_results, yoko_results, olympic_totals, olympic_points_from_medals,
-    best_and_gross, point_tourney_results, las_vegas_results,
+    best_and_gross, point_tourney_results, las_vegas_results, LV_TEAM_MODES,
     OLYMPIC_GUIDE, GAME_GUIDE, DEFAULT_RULES, OLYMPIC_MEDALS,
+    extra_points, EXTRA_HOLE_AWARDS,
 )
+from data_manager import save_live, load_live
+import live_share
 import ocr_score
 
 GAME_OPTIONS = ["タテ", "ヨコ", "オリンピック", "ポイントターニー",
@@ -136,35 +140,570 @@ def _kana_key(s):
     return "".join(out)
 
 
-def number_row(prefix, pi, holes, labels, defaults, minv, maxv):
-    """ホールごとの number_input を横並びで作り、値リストを返す"""
-    vals = []
-    cols = st.columns(len(holes))
-    for c, h, lab in zip(cols, holes, labels):
-        with c:
-            vals.append(st.number_input(
-                lab, min_value=minv, max_value=maxv,
-                value=defaults[h], key=f"{prefix}_{pi}_{h}",
-            ))
-    return vals
 
 
-def score_putt_block(pi, holes, pars, record_putts):
-    """各ホールについて、スコア入力の真下にパット入力（記録する場合）を縦に並べる。
-    Returns: (scores list, putts list)。記録しない場合 putts は []。
+# ===== ライブ観戦（QR共有）と LINE 速報 =====
+def app_base_url():
+    """観戦URLの土台になるアプリのURL。secrets → 楽天のReferer → 画面入力 の順。"""
+    for name in ("APP_BASE_URL", "RAKUTEN_REFERER"):
+        v = _secret_or_env(name, "app_base_url")
+        if v:
+            return v.rstrip("/")
+    return ""
+
+
+def live_id_for(play_date, course_name):
+    """同じ日・同じコースなら常に同じ観戦IDになるようにする（再起動しても不変）。"""
+    import hashlib
+    seed = f"{play_date}|{course_name}".encode("utf-8")
+    return hashlib.md5(seed).hexdigest()[:8]
+
+
+def viewer_url(live_id):
+    base = app_base_url()
+    return f"{base}/?live={live_id}" if base else ""
+
+
+def build_live_payload(live_id, play_date, course_name, selected_tee, pars,
+                       num_holes, players, all_scores, entered_map, through,
+                       standings):
+    """観戦ページとLINE速報が使うスナップショットを作る。"""
+    return {
+        "live_id": live_id,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "date": str(play_date),
+        "course_name": course_name,
+        "tee": selected_tee,
+        "pars": list(pars),
+        "num_holes": num_holes,
+        "through": int(through),
+        "players": [{"name": n, "scores": list(all_scores[n]),
+                     "entered": list(entered_map.get(n, []))} for n in players],
+        "standings": standings,
+    }
+
+
+@st.fragment(run_every="10s")
+def _live_view_body(live_id):
+    """観戦ページの中身。10秒ごとにここだけ再実行して最新を取り込む。"""
+    from data_manager import clear_cache
+    clear_cache()
+    payload = load_live(live_id)
+    if not payload:
+        st.info("まだデータがありません。ラウンドが始まるまでお待ちください。")
+        st.caption("この画面は10秒ごとに自動で更新されます。")
+        return
+
+    pars = payload.get("pars") or []
+    num_holes = payload.get("num_holes") or len(pars)
+    through = int(payload.get("through") or 0)
+    par_cut = sum(pars[:through])
+
+    st.subheader(payload.get("course_name", ""))
+    meta = [payload.get("date", "")]
+    if payload.get("tee"):
+        meta.append(f"ティー: {payload['tee']}")
+    meta.append(f"スルー {through} / {num_holes} ホール")
+    st.caption("　·　".join([m for m in meta if m]))
+
+    rows = []
+    for p in payload.get("players", []):
+        sc = p.get("scores") or []
+        ent = p.get("entered") or []
+        row = {"名前": p.get("name", "")}
+        for h in range(num_holes):
+            row[str(h + 1)] = (str(sc[h]) if h < len(ent) and ent[h] else "—")
+        if num_holes == 18:
+            row["OUT"] = sum(sc[:9])
+            row["IN"] = sum(sc[9:18])
+        row["TOTAL"] = sum(sc[:through]) if through else 0
+        row["対Par"] = f"{sum(sc[:through]) - par_cut:+d}" if through else "—"
+        rows.append(row)
+    par_row = {"名前": "Par"}
+    for h in range(num_holes):
+        par_row[str(h + 1)] = str(pars[h])
+    if num_holes == 18:
+        par_row["OUT"] = sum(pars[:9])
+        par_row["IN"] = sum(pars[9:])
+    par_row["TOTAL"] = sum(pars)
+    par_row["対Par"] = ""
+    st.dataframe(pd.DataFrame([par_row] + rows), use_container_width=True,
+                 hide_index=True)
+
+    labels = {"tate": "タテ", "yoko": "ヨコ", "olympic": "オリンピック",
+              "point": "ポイントターニー"}
+    st_d = payload.get("standings") or {}
+    shown = [(labels[k], st_d[k]) for k in labels if st_d.get(k)]
+    if shown:
+        cols = st.columns(len(shown))
+        for col, (lab, d) in zip(cols, shown):
+            with col:
+                order = sorted(d, key=lambda n: d[n], reverse=True)
+                st.markdown(f"**{lab}**")
+                st.dataframe(pd.DataFrame({
+                    "順": [f"{i + 1}" for i in range(len(order))],
+                    "名前": order,
+                    "得点": [f"{d[n]:+d}" for n in order],
+                }), use_container_width=True, hide_index=True)
+
+    st.caption(f"最終更新 {payload.get('updated_at', '')}　"
+               "／　この画面は10秒ごとに自動で更新されます。")
+
+
+def render_live_viewer(live_id):
+    """観戦専用ページ（?live=xxxx で開いたとき）。読むだけで編集はできない。"""
+    st.title("⛳ ライブスコア")
+    _live_view_body(live_id)
+
+
+def render_live_share_settings(play_date, course_name, num_holes, n_players):
+    """ライブ共有（QR）とLINE速報の設定。観戦URLとQRをここに出す。"""
+    lid = live_id_for(play_date, course_name)
+    url = viewer_url(lid)
+    with st.expander("📣 ライブ共有・LINE速報", expanded=False):
+        st.checkbox(
+            "同伴者に途中経過を見せる（ライブ共有をON）", key="live_share_on",
+            help="ONにすると、1ホール全員分の入力が終わるたびに"
+                 "観戦ページの内容が更新されます。")
+
+        if not url:
+            st.warning(
+                "観戦URLの土台になるアプリのURLが未設定です。"
+                "secrets に APP_BASE_URL（例 https://xxxx.streamlit.app）を"
+                "設定してください。ここでの入力はこのセッション限りです。")
+            v = st.text_input("アプリのURL", value="",
+                              placeholder="https://xxxx.streamlit.app",
+                              key="app_base_url")
+            if v:
+                url = f"{v.rstrip('/')}/?live={lid}"
+
+        if url:
+            st.markdown("**観戦ページ（このQRを読んでもらう）**")
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                svg = live_share.qr_svg(url)
+                if svg:
+                    st.markdown(svg, unsafe_allow_html=True)
+                else:
+                    st.caption("QRの生成には segno が必要です"
+                               "（requirements.txt に追加済み）。")
+            with c2:
+                st.code(url, language=None)
+                st.caption("同伴者はこのページを開くだけです。"
+                           "10秒ごとに自動更新され、編集はできません。"
+                           "LINEの通数も消費しません。")
+
+        st.divider()
+        st.markdown("**LINE速報**")
+        tok = _secret_or_env("LINE_CHANNEL_ACCESS_TOKEN", "line_token")
+        to = _secret_or_env("LINE_TO", "line_to")
+        if tok and to:
+            st.caption("🔑 LINEの設定: 済み（secrets / 環境変数から読み込み）")
+        else:
+            miss = [n for n, v in (("チャネルアクセストークン", tok),
+                                   ("送信先ID", to)) if not v]
+            st.info("LINE速報は未設定です（" + " / ".join(miss) + "）。"
+                    "secrets に LINE_CHANNEL_ACCESS_TOKEN と LINE_TO を"
+                    "設定すると使えます。設定しなくても観戦ページは使えます。")
+
+        mode = st.selectbox(
+            "配信頻度", live_share.SEND_MODES, index=1, key="line_send_mode",
+            help="LINEの無料枠は月200通で、グループ送信は人数分カウントされます。")
+        units = live_share.estimate_units(mode, num_holes, n_players)
+        if units:
+            st.caption(f"このラウンドでの消費見込み: 約 **{units} 通**"
+                       f"（{n_players}人 × {units // max(1, n_players)}回）。"
+                       f"無料枠 月200通なら約 {200 // units} ラウンド分です。")
+        return lid, url
+    return lid, url
+
+
+# ===== 特別ポイント（ドラコン・ニアピン・3パット） =====
+def render_extra_points(players, num_holes, rule, key_prefix="ex", saved=None):
+    """ドラコン・ニアピン・3パットの入力UI。
+
+    ドラコン/ニアピンは1ホールにつき1人なので「ホール×誰が取ったか」で入力する。
+    オリンピックのメダルとは**別枠**なので、同じホールでメダルと同時に成立する。
+    3パットはローカルルールのため、パット数からの自動判定はせず手入力にする。
+
+    Returns: (totals, per_hole, awards_by_hole, threeputt)
     """
-    scores, putts = [], []
-    cols = st.columns(len(holes))
-    for c, h in zip(cols, holes):
-        with c:
-            scores.append(st.number_input(
-                f"H{h+1}(P{pars[h]})", min_value=1, max_value=20,
-                value=pars[h], key=f"score_{pi}_{h}"))
-            if record_putts:
-                putts.append(st.number_input(
-                    "パット", min_value=0, max_value=10, value=2,
-                    key=f"putt_{pi}_{h}"))
-    return scores, putts
+    saved = saved or {}
+    kp = key_prefix
+    idx = [f"H{i + 1}" for i in range(num_holes)]
+    opts = ["なし"] + list(players)
+
+    st.markdown("**🏆 特別ポイント（ドラコン・ニアピン・3パット）**")
+    st.caption(f"ドラコン={rule.get('ドラコン', 0)} / "
+               f"ニアピン={rule.get('ニアピン', 0)} / "
+               f"3パット={rule.get('3パット', 0)}　"
+               "オリンピックのメダルとは別枠なので、同じホールで同時に成立します。")
+
+    saved_aw = saved.get("awards_by_hole") or {}
+    aw_data = {}
+    for award in EXTRA_HOLE_AWARDS:
+        col = ["なし"] * num_holes
+        for h, who in (saved_aw.get(award) or {}).items():
+            h = int(h)
+            if 0 <= h < num_holes and who in players:
+                col[h] = who
+        aw_data[award] = col
+    aw_edited = st.data_editor(
+        pd.DataFrame(aw_data, index=idx), use_container_width=True,
+        key=f"{kp}_awards_editor",
+        column_config={a: st.column_config.SelectboxColumn(
+            a, options=opts, required=True) for a in EXTRA_HOLE_AWARDS})
+
+    awards_by_hole = {}
+    for award in EXTRA_HOLE_AWARDS:
+        awards_by_hole[award] = {
+            h: who for h, who in enumerate(list(aw_edited[award]))
+            if who and who != "なし"}
+
+    with st.expander("3パットしたホール（手入力）"):
+        saved_tp = saved.get("threeputt") or {}
+        tp_data = {}
+        for n in players:
+            row = [bool(v) for v in (saved_tp.get(n) or [])]
+            row += [False] * (num_holes - len(row))
+            tp_data[n] = row[:num_holes]
+        tp_edited = st.data_editor(
+            pd.DataFrame(tp_data, index=idx), use_container_width=True,
+            key=f"{kp}_threeputt_editor",
+            column_config={n: st.column_config.CheckboxColumn(n, default=False)
+                           for n in players})
+        threeputt = {n: [bool(v) for v in list(tp_edited[n])] for n in players}
+
+    totals, per_hole = extra_points(players, num_holes, rule,
+                                    awards_by_hole, threeputt)
+    return totals, per_hole, awards_by_hole, threeputt
+
+
+# ===== ラスベガスのオプション（選択式） =====
+def render_lasvegas_rule_options(num_holes, key_prefix="lv", saved=None):
+    """ラスベガスのルール選択UI（プレーヤーが決まっていなくても表示できる）。
+
+    ルールの出典: enjoy-golfer.com「ゴルフのラスベガスの計算方法を徹底解説！」
+    既定はすべてOFF＝素のラスベガス（固定チーム・逆転なし）。
+    """
+    saved = saved or {}
+    kp = key_prefix
+    with st.expander("🎰 ラスベガスの設定（使うオプションだけ選ぶ）", expanded=True):
+        st.caption("何も選ばなければ、素のラスベガス（固定チーム・"
+                   "少ない方=10の位）で集計します。")
+        c1, c2 = st.columns(2)
+        with c1:
+            rotate = st.checkbox(
+                "3ホールごとにチームを入れ替える", key=f"{kp}_rotate",
+                value=bool(saved.get("team_mode") == "3ホールごとに入れ替え"),
+                help="打順(プレーヤー1〜4の並び)をもとに、1-3H は 1-2 vs 3-4、"
+                     "4-6H は 1-3 vs 2-4、7-9H は 1-4 vs 2-3 …と回します。"
+                     "OFFなら全ホール同じチーム（既定）。")
+            birdie_reverse = st.checkbox(
+                "バーディ逆転", key=f"{kp}_birdie_reverse",
+                value=bool(saved.get("birdie_reverse")),
+                help="自分のチームにバーディ以上が出ると、相手チームの数値が"
+                     "ひっくり返ります（例: 相手 5と7 の 57 → 75）。")
+        with c2:
+            drop_ones = st.checkbox(
+                "1の位切り捨て", key=f"{kp}_drop_ones",
+                value=bool(saved.get("drop_ones")),
+                help="チームの数値の1の位を切り捨てます（57→50、46→40）。")
+            carry = st.checkbox(
+                "キャリー", key=f"{kp}_carry", value=bool(saved.get("carry")),
+                help="同点のホールは勝ち点ゼロで持ち越し、次のホールが2倍に"
+                     "なります（連続で同点なら3倍…）。")
+
+        st.markdown("**プッシュ（宣言したホールの勝ち点を倍にする）**")
+        saved_push = {int(k): v for k, v in (saved.get("push_by_hole") or {}).items()}
+        d2 = [h + 1 for h, v in saved_push.items() if v == 2]
+        d4 = [h + 1 for h, v in saved_push.items() if v == 4]
+        holes = list(range(1, num_holes + 1))
+        k2, k4 = f"{kp}_push2", f"{kp}_push4"
+        if k2 not in st.session_state and d2:
+            st.session_state[k2] = d2
+        if k4 not in st.session_state and d4:
+            st.session_state[k4] = d4
+        p2 = st.multiselect("2倍にするホール（1人が宣言）", holes, key=k2)
+        p4 = st.multiselect("4倍にするホール（2人が宣言）", holes, key=k4)
+
+    push_by_hole = {}
+    for n in p2:
+        push_by_hole[n - 1] = 2
+    for n in p4:
+        push_by_hole[n - 1] = 4  # 4倍が優先
+    st.session_state[f"_{kp}_push"] = push_by_hole
+
+    team_mode = "3ホールごとに入れ替え" if rotate else "固定"
+    st.session_state[f"{kp}_team_mode"] = team_mode
+    return {"team_mode": team_mode, "birdie_reverse": birdie_reverse,
+            "drop_ones": drop_ones, "carry": carry,
+            "push_by_hole": push_by_hole}
+
+
+def render_lasvegas_team(names, team_mode, key_prefix="lv", saved=None):
+    """チーム1の2人を選ぶUI。入れ替え方式のときは打順を案内するだけ。"""
+    saved = saved or {}
+    kp = key_prefix
+    if team_mode != "固定":
+        st.caption(f"打順: {' → '.join(names)}　"
+                   "（3ホールごとに組み合わせが変わります）")
+        return []
+    t1_key = f"{kp}_team1"
+    default_t1 = [n for n in (saved.get("team1") or []) if n in names]
+    if t1_key not in st.session_state and len(default_t1) == 2:
+        st.session_state[t1_key] = default_t1
+    return st.multiselect("チーム1（2人選択）", names, key=t1_key,
+                          max_selections=2)
+
+
+def render_lasvegas_result(lv, team1, team2, team_mode, live=False):
+    """ラスベガスの結果表示。チームを入れ替える方式では人別で見せる。"""
+    bp = lv.get("by_player") or {}
+    if team_mode == "固定" and len(team1) == 2 and len(team2) == 2:
+        st.dataframe(pd.DataFrame({
+            "チーム": [f"{team1[0]}＋{team1[1]}", f"{team2[0]}＋{team2[1]}"],
+            "得点": [f"{lv['net1']:+d}", f"{lv['net2']:+d}"],
+        }), use_container_width=True, hide_index=True)
+        if live:
+            lead = ("チーム1 リード" if lv["net1"] > 0 else
+                    "チーム2 リード" if lv["net1"] < 0 else "同点")
+            st.markdown(f"**{lead}**")
+        else:
+            win = ("チーム1の勝ち" if lv["net1"] > 0 else
+                   "チーム2の勝ち" if lv["net1"] < 0 else "引き分け")
+            st.markdown(f"### {win}")
+    else:
+        order = sorted(bp, key=lambda n: bp[n], reverse=True)
+        st.caption("3ホールごとに組み合わせが変わるため、人ごとの合計で表示します。")
+        st.dataframe(pd.DataFrame({
+            "順": [f"{i + 1}" for i in range(len(order))],
+            "名前": order,
+            "得点": [f"{bp[n]:+d}" for n in order],
+        }), use_container_width=True, hide_index=True)
+
+    with st.expander("ホール別明細"):
+        rows = []
+        for d in lv["per_hole"]:
+            mark = []
+            if d.get("birdie1"):
+                mark.append("T1バーディ")
+            if d.get("birdie2"):
+                mark.append("T2バーディ")
+            rows.append({
+                "H": d["hole"],
+                "チーム1": "＋".join(d.get("t1") or []),
+                "数値1": d["n1"],
+                "チーム2": "＋".join(d.get("t2") or []),
+                "数値2": d["n2"],
+                "差": f"{d['diff']:+d}",
+                "倍率": f"×{d.get('mult', 1)}",
+                "得点": f"{d.get('gain', d['diff']):+d}",
+                "備考": " / ".join(mark),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                     hide_index=True)
+
+
+# ===== ホール単位のスコア入力（パー基準ボタン方式） =====
+DIFF_LABELS = {-3: "アルバトロス", -2: "イーグル", -1: "バーディ", 0: "パー",
+               1: "ボギー", 2: "ダボ", 3: "トリプル"}
+
+
+def diff_label(diff):
+    """パーとの差を日本語のスコア名にする。範囲外は ±N で返す。"""
+    if diff in DIFF_LABELS:
+        return DIFF_LABELS[diff]
+    return f"+{diff}" if diff > 0 else str(diff)
+
+
+def _sc_key(pi, h):
+    return f"score_{pi}_{h}"
+
+
+def _done_key(pi, h):
+    return f"scored_{pi}_{h}"
+
+
+def _pt_key(pi, h):
+    return f"putt_{pi}_{h}"
+
+
+def hole_candidates(par):
+    """そのホールでボタンに出す打数（パー基準 −1〜+3、1打未満は出さない）。"""
+    return [par + d for d in (-1, 0, 1, 2, 3) if par + d >= 1]
+
+
+def render_hole_input(players, pars, num_holes, tee_yards, course_hdcps,
+                      record_putts):
+    """1ホールずつ、全員分をまとめて入力する画面を描く。
+
+    以前はプレーヤーごとに18ホールを縦に並べていたため、1ホール入力するたびに
+    画面を上下に往復する必要があった（3人なら1ホールにつき往復2回）。
+    ここではホールを単位にして、全員分を1画面に収める。
+
+    値は従来どおり session_state の score_{pi}_{h} に入れる（保存処理・ライブ集計は
+    そのまま動く）。加えて scored_{pi}_{h} で「実際に入力したか」を持ち、
+    未入力とパー入力を区別できるようにしている。
+
+    Returns: (all_scores {name: [打数...]}, all_putts {name: [パット...] or []})
+    """
+    ss = st.session_state
+    np_ = len(players)
+    ss.setdefault("cur_hole", 0)
+    if ss["cur_hole"] >= num_holes:
+        ss["cur_hole"] = 0
+    h = ss["cur_hole"]
+    par = pars[h]
+
+    def entered(pi, hh):
+        return bool(ss.get(_done_key(pi, hh)))
+
+    def value(pi, hh):
+        v = ss.get(_sc_key(pi, hh))
+        return int(v) if isinstance(v, (int, float)) else pars[hh]
+
+    # --- ホール移動 ---
+    n1, n2, n3 = st.columns([1, 3, 1])
+    with n1:
+        if st.button("◀ 前", use_container_width=True, disabled=(h == 0),
+                     key="hole_prev"):
+            ss["cur_hole"] = max(0, h - 1)
+            st.rerun()
+    with n2:
+        bits = [f"### H{h + 1}", f"Par {par}"]
+        y = tee_yards[h] if h < len(tee_yards) and tee_yards[h] else None
+        if y:
+            bits.append(f"{y}Y")
+        hd = course_hdcps[h] if h < len(course_hdcps) and course_hdcps[h] else None
+        if hd:
+            bits.append(f"HDCP {hd}")
+        st.markdown("　·　".join(bits))
+    with n3:
+        if st.button("次 ▶", use_container_width=True,
+                     disabled=(h >= num_holes - 1), key="hole_next"):
+            ss["cur_hole"] = min(num_holes - 1, h + 1)
+            st.rerun()
+
+    done_holes = sum(1 for hh in range(num_holes)
+                     if all(entered(pi, hh) for pi in range(np_)))
+    ss["_done_holes"] = done_holes
+    st.progress(done_holes / num_holes,
+                text=f"入力済み {done_holes} / {num_holes} ホール")
+
+    # 【重要】この checkbox はプレーヤー行より前に描くこと。
+    # 後ろに置くと、ボタンを押した回は st.rerun() で到達せず未描画になり、
+    # Streamlit が widget 状態を破棄して OFF が保持されない。
+    st.checkbox("全員入力したら自動で次のホールへ進む", value=True, key="auto_next")
+
+    cands = hole_candidates(par)
+    st.caption("　".join(f"**{n}**={diff_label(n - par)}" for n in cands)
+               + "　／　それ以外は「…」")
+
+    was_all = all(entered(pi, h) for pi in range(np_))
+    changed = False
+
+    for pi, name in enumerate(players):
+        cur, ok = value(pi, h), entered(pi, h)
+        cols = st.columns([2.2] + [1] * len(cands) + [0.9])
+        with cols[0]:
+            st.markdown(f"**{name}**")
+            st.caption(f"{cur}（{diff_label(cur - par)}）" if ok else "未入力")
+        for ci, n in enumerate(cands):
+            with cols[ci + 1]:
+                sel = ok and cur == n
+                if st.button(str(n), key=f"scbtn_{pi}_{h}_{n}",
+                             use_container_width=True,
+                             type=("primary" if sel else "secondary")):
+                    ss[_sc_key(pi, h)] = n
+                    ss[_done_key(pi, h)] = True
+                    ss.pop(f"otheropen_{pi}_{h}", None)
+                    changed = True
+        with cols[-1]:
+            oth = f"otheropen_{pi}_{h}"
+            is_other = ok and cur not in cands
+            if st.button("…", key=f"othbtn_{pi}_{h}", use_container_width=True,
+                         type=("primary" if is_other else "secondary"),
+                         help="7打以上など、ボタンに無い打数を直接入力します"):
+                ss[oth] = not ss.get(oth, False)
+                st.rerun()
+            if ss.get(oth):
+                v = st.number_input("打数", min_value=1, max_value=20, value=cur,
+                                    key=f"othnum_{pi}_{h}",
+                                    label_visibility="collapsed")
+                if int(v) != cur or not ok:
+                    ss[_sc_key(pi, h)] = int(v)
+                    ss[_done_key(pi, h)] = True
+
+        if record_putts:
+            pc = st.columns([2.2] + [1] * 5 + [0.9])
+            with pc[0]:
+                cur_pt = ss.get(_pt_key(pi, h))
+                st.caption(f"パット {cur_pt}" if cur_pt else "パット 未入力")
+            for ci, n in enumerate([1, 2, 3, 4, 5]):
+                with pc[ci + 1]:
+                    psel = ss.get(_pt_key(pi, h)) == n
+                    if st.button(str(n), key=f"ptbtn_{pi}_{h}_{n}",
+                                 use_container_width=True,
+                                 type=("primary" if psel else "secondary")):
+                        ss[_pt_key(pi, h)] = n
+                        st.rerun()
+        st.divider()
+
+    # 全員そろった瞬間だけ、自動で次のホールへ進む（修正時は動かない）
+    if changed:
+        now_all = all(entered(pi, h) for pi in range(np_))
+        if now_all and not was_all:
+            # このホールが全員そろった、というできごとを記録しておく。
+            # ライブ共有の保存とLINE速報は、集計が出そろう後段でまとめて行う。
+            ss["_completed_hole"] = h + 1
+        if (now_all and not was_all and h < num_holes - 1
+                and ss.get("auto_next", True)):
+            ss["cur_hole"] = h + 1
+        st.rerun()
+
+    # --- 値の組み立て（未入力ホールはParで埋める。集計側の従来動作に合わせる）---
+    all_scores, all_putts = {}, {}
+    for pi, name in enumerate(players):
+        all_scores[name] = [value(pi, hh) for hh in range(num_holes)]
+        all_putts[name] = ([int(ss.get(_pt_key(pi, hh)) or 2)
+                            for hh in range(num_holes)] if record_putts else [])
+
+    st.session_state["_entered_map"] = {
+        name: [entered(pi, hh) for hh in range(num_holes)]
+        for pi, name in enumerate(players)}
+
+    # --- 一覧（確認・ホール移動）。畳むと現在地を見失うため常時表示にする ---
+    st.markdown(f"##### 📋 全ホール一覧（入力済み {done_holes}/{num_holes}）")
+    if True:
+        rows = []
+        for pi, name in enumerate(players):
+            row = {"名前": name}
+            for hh in range(num_holes):
+                row[str(hh + 1)] = (str(value(pi, hh)) if entered(pi, hh) else "—")
+            if num_holes == 18:
+                row["OUT"] = sum(value(pi, hh) for hh in range(9))
+                row["IN"] = sum(value(pi, hh) for hh in range(9, 18))
+            row["TOTAL"] = sum(all_scores[name])
+            rows.append(row)
+        par_row = {"名前": "Par"}
+        for hh in range(num_holes):
+            par_row[str(hh + 1)] = str(pars[hh])
+        if num_holes == 18:
+            par_row["OUT"] = sum(pars[:9])
+            par_row["IN"] = sum(pars[9:])
+        par_row["TOTAL"] = sum(pars)
+        st.dataframe(pd.DataFrame([par_row] + rows), use_container_width=True,
+                     hide_index=True)
+        st.caption("「—」は未入力です。合計にはParを仮置きして計算しています。")
+        jump = st.selectbox("ホールへ移動", range(1, num_holes + 1),
+                            index=h, key="hole_jump",
+                            format_func=lambda n: f"H{n}（Par {pars[n - 1]}）")
+        if st.button("このホールへ移動", key="hole_jump_go"):
+            ss["cur_hole"] = jump - 1
+            st.rerun()
+
+    return all_scores, all_putts
 
 st.set_page_config(
     page_title="ゴルフスコア集計",
@@ -214,7 +753,9 @@ except Exception as e:
             "・Google Sheets APIが有効か をご確認ください。")
     st.stop()
 
-st.title("⛳ ゴルフスコア集計")
+# 観戦モード(?live=)ではこの見出しを出さない（観戦ページ側で自前の見出しを出す）
+if not st.query_params.get("live"):
+    st.title("⛳ ゴルフスコア集計")
 
 
 def _ocr_api_key():
@@ -238,11 +779,18 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
     ss.setdefault("ocr_halves", {})            # {"OUT":{names:[...],scores:[[..],..],detected}, "IN":{...}}
     ss.setdefault("ocr_names", [])             # 基準ハーフ(名前が多い方)の name_raw 一覧（列順）
 
+    # キーは secrets / 環境変数 で設定するのが本筋。設定済みなら画面には出さない
+    # （伏字でも肩越しに見える・セッションに残る・誤操作で消えるため）。
     default_key = _ocr_api_key()
-    api_key = st.text_input(
-        "OpenAI API キー", value=default_key, type="password", key="ocr_api_key",
-        help="環境変数 OPENAI_API_KEY や .streamlit/secrets.toml でも設定できます。"
-             "設定済みなら空欄のままでOK。")
+    if default_key:
+        st.caption("🔑 OpenAI APIキー: 設定済み（secrets / 環境変数から読み込み）")
+        api_key = default_key
+    else:
+        st.warning("OpenAI APIキーが未設定です。"
+                   "本来は .streamlit/secrets.toml か環境変数 OPENAI_API_KEY に "
+                   "設定してください。ここでの入力はこのセッション限りの応急処置です。")
+        api_key = st.text_input(
+            "OpenAI API キー（応急）", value="", type="password", key="ocr_api_key")
     model = st.selectbox("モデル", ["gpt-5.5", "gpt-4o", "gpt-4o-mini"],
                          index=0, key="ocr_model",
                          help="既定は gpt-5.5。空返り等でうまく読めない時は gpt-4o に切替。")
@@ -380,6 +928,8 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
                 v = s18[h]
                 st.session_state[f"score_{pi}_{h}"] = (
                     int(v) if isinstance(v, int) else int(course_pars[h]))
+                # 読み取れたホールだけ「入力済み」にする（残りは未入力のまま）
+                st.session_state[f"scored_{pi}_{h}"] = isinstance(v, int)
         st.session_state["live_through"] = min(max(through, 1), 18)
         ss.ocr_imported_msg = (
             f"{len(roster)}人・{through}ホールまでを下の入力フォームに取り込みました。"
@@ -480,6 +1030,14 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
         st.balloons()
 
 
+# ===== 観戦モード =====
+# URLに ?live=xxxx が付いていたら、読み取り専用の観戦ページだけを描いて終了する。
+# 同伴者はQRを読むだけでここに来るので、編集用のタブは一切出さない。
+_live_param = st.query_params.get("live")
+if _live_param:
+    render_live_viewer(_live_param)
+    st.stop()
+
 tab1, tab2, tab5, tab3, tab4 = st.tabs(
     ["📝 スコア入力", "📊 集計・分析", "🎮 ゲーム集計",
      "⛳ コース管理", "📋 ラウンド履歴"]
@@ -498,19 +1056,11 @@ with tab1:
         prefs = load_prefs()
         play_date = st.date_input("プレー日", value=date.today())
 
-        # ゴルフ場検索（名前の一部で絞り込み）
-        search = st.text_input("🔍 ゴルフ場を検索", key="course_search",
-                               placeholder="名前の一部を入力（例: 霞）")
-        if search.strip():
-            filtered = [n for n in course_names if search.strip().lower() in n.lower()]
-            if not filtered:
-                st.caption("該当なし → 全件を表示します。")
-                filtered = course_names
-        else:
-            filtered = course_names
-
-        selected_course_name = st.selectbox("ゴルフ場を選択", filtered,
-                                            key="score_course_select")
+        # 検索欄と選択欄を分けていたが、selectbox 自体が入力での絞り込みに
+        # 対応しているため二重だった。1つにまとめる。
+        selected_course_name = st.selectbox(
+            "⛳ ゴルフ場", course_names, key="score_course_select",
+            help="欄をタップして名前の一部を入力すると絞り込めます（例: 霞）。")
         selected_course = next(c for c in courses if c["name"] == selected_course_name)
         pars = selected_course["pars"]
         num_holes = selected_course["holes"]
@@ -583,6 +1133,14 @@ with tab1:
                 bg_birdie = st.checkbox("バーディ賞を有効にする（実打バーディで+1点）",
                                         value=True, key="bg_birdie")
 
+        # ラスベガスの設定（選択時）。プレーヤーが決まる前でも選べるよう
+        # ここ（ゲーム設定の並び）に置く。チーム1の選択だけ後段で行う。
+        lv_rules = {"team_mode": "固定", "birdie_reverse": False,
+                    "drop_ones": False, "carry": False, "push_by_hole": {}}
+        if "ラスベガス" in games_sel:
+            lv_rules = render_lasvegas_rule_options(
+                num_holes, key_prefix="lv", saved=prefs.get("lasvegas") or {})
+
         # 得点ルールのカスタマイズ
         _r = get_rules()
         with st.expander("⚙️ 得点ルールの設定（カスタマイズ）"):
@@ -604,6 +1162,19 @@ with tab1:
                         medal, min_value=0, max_value=99,
                         value=int(_r["olympic"][medal]), key=f"rule_oly_{medal}")
 
+            st.markdown("**特別ポイント（オリンピックとは別枠）**")
+            _re = {**DEFAULT_RULES["extra"], **(_r.get("extra") or {})}
+            ec = st.columns(3)
+            extra_rule = {}
+            for col, (k, hlp) in zip(ec, [
+                    ("ドラコン", "そのホールで一番飛んだ人"),
+                    ("ニアピン", "そのホールでピンに一番近い人"),
+                    ("3パット", "3パット以上した人（ローカルルール。手入力）")]):
+                with col:
+                    extra_rule[k] = st.number_input(
+                        k, min_value=-99, max_value=99,
+                        value=int(_re[k]), key=f"rule_ex_{k}", help=hlp)
+
             st.markdown("**ポイントターニーの配点（パーとの差）**")
             pc = st.columns(5)
             point_labels = [("eagle", "イーグル以上"), ("birdie", "バーディ"),
@@ -617,7 +1188,8 @@ with tab1:
                         value=int(_r["point"][k]), key=f"rule_pt_{k}")
 
             current_rules = {"tate_pt": tate_pt, "yoko_pt": yoko_pt,
-                             "olympic": olympic_rule, "point": point_rule}
+                             "olympic": olympic_rule, "point": point_rule,
+                             "extra": extra_rule}
             if st.button("💾 このルールを保存（次回も使う）", key="save_rules"):
                 update_prefs(rules=current_rules)
                 st.success("得点ルールを保存しました。")
@@ -629,6 +1201,10 @@ with tab1:
                         for m in ["金", "銀", "銅", "鉄", "チップイン"]},
             "point": {k: st.session_state.get(f"rule_pt_{k}", _r["point"][k])
                       for k in ["eagle", "birdie", "par", "bogey", "double"]},
+            "extra": {k: st.session_state.get(
+                f"rule_ex_{k}",
+                {**DEFAULT_RULES["extra"], **(_r.get("extra") or {})}[k])
+                for k in ["ドラコン", "ニアピン", "3パット"]},
         }
 
         # パット数を記録するか（早い段階で確認）
@@ -640,6 +1216,7 @@ with tab1:
 
         st.subheader("プレーヤー設定")
         existing_players = get_all_player_names()
+        _live_id_hint = live_id_for(play_date, selected_course_name)
 
         # 自分の名前は前回を記憶（次回以降は自動入力）
         if "player_name_0" not in st.session_state:
@@ -675,43 +1252,24 @@ with tab1:
                     name = st.text_input(f"{label}の名前", key=f"player_name_{i}")
             players.append(name)
 
+        live_id, live_url = render_live_share_settings(
+            play_date, selected_course_name, num_holes, max(1, len(players)))
+
         if all(players):
             st.subheader("スコア入力")
-            all_scores = {}
-            all_putts = {}
 
-            def putt_part(total):
-                return f" / パット {total}" if record_putts else ""
-
-            for pi, player_name in enumerate(players):
-                st.markdown(f"**{player_name}**")
-
-                if num_holes == 18:
-                    st.markdown("*OUT (1-9)*")
-                    so, po = score_putt_block(pi, range(9), pars, record_putts)
-                    st.caption(f"OUT スコア **{sum(so)}**{putt_part(sum(po))}"
-                               f"（Par {sum(pars[:9])}）")
-                    st.markdown("*IN (10-18)*")
-                    si, pi_ = score_putt_block(pi, range(9, 18), pars, record_putts)
-                    st.caption(f"IN スコア **{sum(si)}**{putt_part(sum(pi_))}"
-                               f"（Par {sum(pars[9:])}）")
-                    sc, pt = so + si, po + pi_
-                    st.markdown(f"TOTAL スコア **{sum(sc)}**{putt_part(sum(pt))}"
-                                f"（Par {sum(pars)}）")
-                else:
-                    st.markdown("*スコア*")
-                    sc, pt = score_putt_block(pi, range(num_holes), pars,
-                                              record_putts)
-                    st.markdown(f"TOTAL スコア **{sum(sc)}**{putt_part(sum(pt))}"
-                                f"（Par {sum(pars)}）")
-
-                all_scores[player_name] = sc
-                all_putts[player_name] = pt
-                st.divider()
+            # ===== ホール単位の入力 =====
+            # 以前はプレーヤーごとに18ホールを縦に並べていたため、1ホール入力する
+            # たびに画面を上下に往復する必要があった。ホール単位に組み替えている。
+            all_scores, all_putts = render_hole_input(
+                players, pars, num_holes, tee_yards, course_hdcps, record_putts)
 
             # ===== ライブ・ゲーム集計（入力しながら途中経過を表示） =====
             # 保存処理でも参照するため、人数に関わらず既定値を用意しておく
             live_olympic = None
+            live_standings = {}   # ライブ共有・LINE速報に渡す各ゲームの順位
+            live_extra = None
+            ex_awards, ex_threeputt = {}, {}
             medals = {}
             hcap_games = []
             raw_hdcp = {n: 0 for n in players}
@@ -721,11 +1279,21 @@ with tab1:
             st.subheader("📊 現在のゲーム状況（ライブ）")
             st.caption("※ ゲームの種類・得点ルールは上の「🎮 ゲーム設定」で変更できます。")
 
-            through = st.number_input(
-                "集計対象ホール数（スルー）", min_value=1, max_value=num_holes,
-                value=num_holes, key="live_through",
-                help="ここまで消化したホール数。未入力ホールはParのまま計算されます。",
-            )
+            # スルー（集計対象ホール数）は、全員そろって入力できているホール数に
+            # 自動追従させる。手で変えたいときだけ切り替える。
+            auto_done = int(st.session_state.get("_done_holes", 0))
+            manual_through = st.checkbox(
+                "集計対象ホール数を手動で指定する", key="through_manual",
+                help="既定は「全員のスコアが入力済みのホール数」に自動追従します。")
+            if manual_through:
+                through = st.number_input(
+                    "集計対象ホール数（スルー）", min_value=1, max_value=num_holes,
+                    value=max(1, auto_done or num_holes), key="live_through",
+                    help="未入力ホールはParのまま計算されます。")
+            else:
+                through = max(1, auto_done)
+                st.caption(f"集計対象: スルー **{through}** ホール"
+                           f"（全員入力済みのホール数に自動追従）")
 
             if len(players) >= 2:
                 live_players = [
@@ -783,6 +1351,7 @@ with tab1:
                                 g_tot, nt_tot, t_net, _ = tate_results(
                                     live_players, current_rules["tate_pt"],
                                     ty_handicaps)
+                                live_standings["tate"] = dict(t_net)
                                 t_order = sorted(players, key=lambda n: nt_tot[n])
                                 st.dataframe(pd.DataFrame({
                                     "順": [f"{i+1}" for i in range(len(t_order))],
@@ -796,6 +1365,7 @@ with tab1:
                                 y_won, _, y_net = yoko_results(
                                     live_players, through, current_rules["yoko_pt"],
                                     ty_handicaps, course_hdcps)
+                                live_standings["yoko"] = dict(y_net)
                                 y_order = sorted(players,
                                                  key=lambda n: y_net[n], reverse=True)
                                 st.dataframe(pd.DataFrame({
@@ -828,11 +1398,23 @@ with tab1:
                     medals = {n: list(oly_edited[n]) for n in players}
                     live_olympic = olympic_points_from_medals(medals, oru)
                     o_tot = {n: sum(live_olympic[n][:through]) for n in players}
-                    o_order = sorted(players, key=lambda n: o_tot[n], reverse=True)
+
+                    ex_rule = current_rules.get("extra") or DEFAULT_RULES["extra"]
+                    (ex_tot, live_extra, ex_awards,
+                     ex_threeputt) = render_extra_points(
+                        players, num_holes, ex_rule, key_prefix="ex")
+                    ex_tot = {n: sum(live_extra[n][:through]) for n in players}
+
+                    tot_all = {n: o_tot[n] + ex_tot.get(n, 0) for n in players}
+                    live_standings["olympic"] = dict(tot_all)
+                    o_order = sorted(players, key=lambda n: tot_all[n],
+                                     reverse=True)
                     st.dataframe(pd.DataFrame({
                         "順": [f"{i+1}" for i in range(len(o_order))],
                         "名前": o_order,
-                        "得点": [o_tot[n] for n in o_order],
+                        "メダル": [o_tot[n] for n in o_order],
+                        "特別": [f"{ex_tot.get(n, 0):+d}" for n in o_order],
+                        "合計": [tot_all[n] for n in o_order],
                     }), use_container_width=True, hide_index=True)
 
                 # ベスト＆グロス（4人チーム戦）
@@ -920,6 +1502,7 @@ with tab1:
                     pt_tot, _ = point_tourney_results(
                         [{"name": n, "scores": all_scores[n]} for n in players],
                         pars, pr, num_holes=num_holes, played_count=through)
+                    live_standings["point"] = dict(pt_tot)
                     pt_order = sorted(players, key=lambda n: pt_tot[n], reverse=True)
                     st.dataframe(pd.DataFrame({
                         "順": [f"{i+1}" for i in range(len(pt_order))],
@@ -931,26 +1514,30 @@ with tab1:
                 if "ラスベガス" in games_sel:
                     st.markdown("**🎰 ラスベガス**")
                     if len(players) != 4:
-                        st.warning("ラスベガスは4人ちょうどで行います。")
+                        st.warning(f"ラスベガスは4人ちょうどで行います"
+                                   f"（現在 {len(players)}人）。"
+                                   "ルールの選択は上の「🎰 ラスベガスの設定」でできます。")
                     else:
-                        lv_t1 = st.multiselect(
-                            "チーム1（2人選択）", players, key="lv_team1",
-                            max_selections=2)
-                        if len(lv_t1) != 2:
-                            st.info("チーム1のメンバーを2人選んでください。")
+                        lv_t1 = render_lasvegas_team(
+                            players, lv_rules["team_mode"], key_prefix="lv",
+                            saved=prefs.get("lasvegas") or {})
+                        if lv_rules["team_mode"] == "固定" and len(lv_t1) != 2:
+                            st.info("チーム1のメンバーを2人選んでください。"
+                                    "（オプションは上の「🎰 ラスベガスの設定」です）")
                         else:
                             lv_t2 = [n for n in players if n not in lv_t1]
                             lv = las_vegas_results(
                                 lv_t1, lv_t2, {n: all_scores[n] for n in players},
-                                num_holes=num_holes, played_count=through)
-                            st.dataframe(pd.DataFrame({
-                                "チーム": [f"{lv_t1[0]}＋{lv_t1[1]}",
-                                         f"{lv_t2[0]}＋{lv_t2[1]}"],
-                                "得点": [f"{lv['net1']:+d}", f"{lv['net2']:+d}"],
-                            }), use_container_width=True, hide_index=True)
-                            lead = ("チーム1 リード" if lv["net1"] > 0 else
-                                    "チーム2 リード" if lv["net1"] < 0 else "同点")
-                            st.markdown(f"**{lead}**")
+                                num_holes=num_holes, played_count=through,
+                                pars=pars, players=players,
+                                team_mode=lv_rules["team_mode"],
+                                birdie_reverse=lv_rules["birdie_reverse"],
+                                drop_ones=lv_rules["drop_ones"],
+                                carry=lv_rules["carry"],
+                                push_by_hole=lv_rules["push_by_hole"])
+                            render_lasvegas_result(lv, lv_t1, lv_t2,
+                                                   lv_rules["team_mode"],
+                                                   live=True)
             else:
                 # 1人プレーは対パーの状況のみ
                 me = players[0]
@@ -959,6 +1546,55 @@ with tab1:
                 st.metric(f"{me} スルー{through}H",
                           f"{cur} (Par {par_cur})", f"{cur - par_cur:+d}")
                 st.caption("ゲーム集計（タテ/ヨコ/オリンピック）は2人以上で表示されます。")
+
+            # ===== ライブ共有の保存と LINE 速報 =====
+            _entered = st.session_state.get("_entered_map") or {}
+            live_payload = build_live_payload(
+                live_id, play_date, selected_course_name, selected_tee, pars,
+                num_holes, players, all_scores, _entered, through,
+                live_standings)
+            _done_hole = st.session_state.pop("_completed_hole", None)
+            _line_tok = _secret_or_env("LINE_CHANNEL_ACCESS_TOKEN", "line_token")
+            _line_to = _secret_or_env("LINE_TO", "line_to")
+
+            if st.session_state.get("live_share_on") and _done_hole:
+                try:
+                    save_live(live_id, live_payload)
+                except Exception as e:
+                    st.warning(f"ライブ共有の保存に失敗しました: {e}")
+                _mode = st.session_state.get("line_send_mode",
+                                             live_share.SEND_MODES[1])
+                _sent = st.session_state.setdefault("_line_sent", set())
+                if (_done_hole in live_share.milestones(_mode, num_holes)
+                        and _done_hole not in _sent):
+                    ok, msg = live_share.line_push(
+                        _line_tok, _line_to,
+                        live_share.flash_text(live_payload, _done_hole,
+                                              live_url))
+                    if ok:
+                        _sent.add(_done_hole)
+                        st.success(f"LINEに速報を送りました（{_done_hole}H）")
+                    else:
+                        st.warning(f"LINE速報を送れませんでした: {msg}")
+
+            if st.session_state.get("live_share_on") or (_line_tok and _line_to):
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    if st.button("🔄 観戦ページをいま更新する",
+                                 use_container_width=True, key="live_push_now"):
+                        try:
+                            save_live(live_id, live_payload)
+                            st.success("観戦ページを更新しました。")
+                        except Exception as e:
+                            st.error(f"更新に失敗しました: {e}")
+                with mc2:
+                    if st.button("📣 いまの状況をLINEに送る",
+                                 use_container_width=True, key="line_push_now"):
+                        ok, msg = live_share.line_push(
+                            _line_tok, _line_to,
+                            live_share.flash_text(live_payload, through,
+                                                  live_url))
+                        (st.success if ok else st.error)(msg)
 
             st.divider()
             if st.button("💾 スコアを保存", type="primary", use_container_width=True):
@@ -982,6 +1618,11 @@ with tab1:
                 if live_olympic and "オリンピック" in games_sel:
                     round_data["olympic"] = live_olympic
                     round_data["olympic_medals"] = {n: medals[n] for n in players}
+                    round_data["extra"] = live_extra
+                    round_data["extra_awards"] = {
+                        a: {str(h): w for h, w in (ex_awards.get(a) or {}).items()}
+                        for a in EXTRA_HOLE_AWARDS}
+                    round_data["extra_threeputt"] = ex_threeputt
                 # ハンデ情報（タテ/ヨコ/B&G共通）
                 if hcap_games:
                     round_data["hcap_mode"] = st.session_state.get("hcap_mode")
@@ -996,18 +1637,47 @@ with tab1:
                         "override": bg_override,
                     }
                 lv_t1 = st.session_state.get("lv_team1") or []
-                if "ラスベガス" in games_sel and len(lv_t1) == 2:
-                    round_data["lasvegas"] = {"team1": lv_t1}
+                if "ラスベガス" in games_sel and len(players) == 4:
+                    round_data["lasvegas"] = {
+                        "team1": lv_t1,
+                        "team_mode": st.session_state.get("lv_team_mode", "固定"),
+                        "birdie_reverse": bool(
+                            st.session_state.get("lv_birdie_reverse")),
+                        "drop_ones": bool(st.session_state.get("lv_drop_ones")),
+                        "carry": bool(st.session_state.get("lv_carry")),
+                        "push_by_hole": {
+                            str(k): v for k, v in
+                            (st.session_state.get("_lv_push") or {}).items()},
+                    }
                 save_round(round_data)
                 # 次回のために自分の名前・ティー・やるゲーム・ルール・HDCPを記憶
                 _pref_kwargs = dict(my_name=players[0], last_tee=selected_tee,
                                     games=games_sel, rules=current_rules,
                                     record_putts=record_putts)
+                if "ラスベガス" in games_sel:
+                    _pref_kwargs["lasvegas"] = {
+                        "team1": st.session_state.get("lv_team1") or [],
+                        "team_mode": lv_rules["team_mode"],
+                        "birdie_reverse": lv_rules["birdie_reverse"],
+                        "drop_ones": lv_rules["drop_ones"],
+                        "carry": lv_rules["carry"],
+                        "push_by_hole": {str(k): v for k, v
+                                         in lv_rules["push_by_hole"].items()},
+                    }
                 if hcap_games and any(raw_hdcp.values()):
                     saved_ph = dict(prefs.get("player_hdcps", {}))
                     saved_ph.update(raw_hdcp)
                     _pref_kwargs["player_hdcps"] = saved_ph
                 update_prefs(**_pref_kwargs)
+                if (st.session_state.get("live_share_on")
+                        and _line_tok and _line_to
+                        and st.session_state.get("line_send_mode")
+                        != live_share.SEND_MODES[0]):
+                    ok, msg = live_share.line_push(
+                        _line_tok, _line_to,
+                        live_share.flash_text(live_payload, num_holes, live_url))
+                    if not ok:
+                        st.warning(f"最終結果のLINE送信に失敗: {msg}")
                 st.success("スコアを保存しました！")
                 st.balloons()
         else:
@@ -1409,6 +2079,8 @@ with tab2:
                         player_rounds.append({
                             "date": r["date"], "course": r["course_name"],
                             "total": sum(p["scores"])})
+            # 保存順のままだと線が時系列を往復して読めないため、日付昇順に並べる
+            player_rounds.sort(key=lambda x: x["date"])
             if len(player_rounds) > 1:
                 st.subheader("スコア推移")
                 fig2 = px.line(pd.DataFrame(player_rounds), x="date", y="total",
@@ -1598,39 +2270,37 @@ with tab5:
             # === ラスベガス ===
             elif game == "ラスベガス":
                 st.subheader("ラスベガス（2対2ペア戦）")
-                lv_saved = (gr.get("lasvegas") or {}).get("team1") or []
+                lv_saved = gr.get("lasvegas") or {}
                 if len(g_names) != 4:
                     st.warning("ラスベガスは4人ちょうどのラウンドが対象です。")
                 else:
-                    default_t1 = [n for n in lv_saved if n in g_names]
-                    lv_t1 = st.multiselect(
-                        "チーム1（2人選択）", g_names,
-                        default=default_t1 if len(default_t1) == 2 else [],
-                        max_selections=2, key=f"lv5_team1_{gr['id']}")
-                    if len(lv_t1) != 2:
+                    kp = f"lv5_{gr['id']}"
+                    o = render_lasvegas_rule_options(g_num, key_prefix=kp,
+                                                     saved=lv_saved)
+                    lv_t1 = render_lasvegas_team(g_names, o["team_mode"],
+                                                 key_prefix=kp, saved=lv_saved)
+                    if o["team_mode"] == "固定" and len(lv_t1) != 2:
                         st.info("チーム1のメンバーを2人選んでください。")
                     else:
                         lv_t2 = [n for n in g_names if n not in lv_t1]
                         lv = las_vegas_results(
                             lv_t1, lv_t2,
                             {p["name"]: p["scores"] for p in g_players},
-                            num_holes=g_num)
-                        st.dataframe(pd.DataFrame({
-                            "チーム": [f"{lv_t1[0]}＋{lv_t1[1]}",
-                                     f"{lv_t2[0]}＋{lv_t2[1]}"],
-                            "得点": [f"{lv['net1']:+d}", f"{lv['net2']:+d}"],
-                        }), use_container_width=True, hide_index=True)
-                        win = ("チーム1の勝ち" if lv["net1"] > 0 else
-                               "チーム2の勝ち" if lv["net1"] < 0 else "引き分け")
-                        st.markdown(f"### {win}")
-                        with st.expander("ホール別明細"):
-                            st.dataframe(pd.DataFrame([{
-                                "H": d["hole"], "チーム1": d["n1"],
-                                "チーム2": d["n2"], "差": f"{d['diff']:+d}",
-                            } for d in lv["per_hole"]]),
-                                use_container_width=True, hide_index=True)
-                        if st.button("💾 チーム設定を保存", key=f"lv5save_{gr['id']}"):
-                            update_round(gr["id"], lasvegas={"team1": lv_t1})
+                            num_holes=g_num, pars=gr.get("pars"),
+                            players=g_names, team_mode=o["team_mode"],
+                            birdie_reverse=o["birdie_reverse"],
+                            drop_ones=o["drop_ones"], carry=o["carry"],
+                            push_by_hole=o["push_by_hole"])
+                        render_lasvegas_result(lv, lv_t1, lv_t2, o["team_mode"])
+                        if st.button("💾 チーム・オプションを保存",
+                                     key=f"lv5save_{gr['id']}"):
+                            update_round(gr["id"], lasvegas={
+                                "team1": lv_t1, "team_mode": o["team_mode"],
+                                "birdie_reverse": o["birdie_reverse"],
+                                "drop_ones": o["drop_ones"], "carry": o["carry"],
+                                "push_by_hole": {str(k): v for k, v
+                                                 in o["push_by_hole"].items()},
+                            })
                             st.success("保存しました！")
 
             # === ベスト＆グロス ===
@@ -1811,31 +2481,46 @@ with tab3:
         app_id = get_rakuten_app_id()
         access_key = get_rakuten_access_key()
         referer = get_rakuten_referer()
-        with st.expander("⚙️ APIキー設定（楽天 applicationId / accessKey）",
-                         expanded=not (app_id and access_key and referer)):
-            st.caption("楽天ウェブサービス(webservice.rakuten.co.jp/app/list)の "
-                       "アプリ情報にある App ID と Access Key を入力してください。"
-                       "2026年2月の基盤刷新以降、両方そろわないと認証できません。"
-                       "一度入力すれば保持されます。")
-            key_in = st.text_input("楽天 applicationId（App ID）", value=app_id,
-                                   type="password", key="app_id_input")
-            if key_in:
-                st.session_state["rakuten_app_id"] = key_in.strip()
-                app_id = key_in.strip()
-            ak_in = st.text_input("楽天 accessKey（Access Key）", value=access_key,
-                                  type="password", key="access_key_input")
-            if ak_in:
-                st.session_state["rakuten_access_key"] = ak_in.strip()
-                access_key = ak_in.strip()
-            rf_in = st.text_input(
-                "呼び出し元サイトURL（Referer）", value=referer,
-                placeholder="https://xxxx.streamlit.app/", key="referer_input",
-                help="楽天のアプリ設定「許可されたWebサイト(Allowed websites)」に"
-                     "登録したURLと同じものを入れてください。"
-                     "サーバーから呼ぶときは、この情報を自分で付けないと403になります。")
-            if rf_in:
-                st.session_state["rakuten_referer"] = rf_in.strip()
-                referer = rf_in.strip()
+        # 認証情報は secrets / 環境変数 で設定するのが本筋。
+        # 3つそろっていれば画面には一切出さない（伏字でも表示しない）。
+        missing = [lab for lab, val in
+                   (("App ID", app_id), ("Access Key", access_key),
+                    ("呼び出し元サイトURL", referer)) if not val]
+        if not missing:
+            st.caption("🔑 楽天ウェブサービスの認証情報: 設定済み"
+                       "（secrets / 環境変数から読み込み）")
+        else:
+            with st.expander(f"⚙️ 未設定の項目があります（{' / '.join(missing)}）",
+                             expanded=True):
+                st.caption("本来は .streamlit/secrets.toml（ローカル）または "
+                           "Streamlit Cloud の Secrets に "
+                           "RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY / RAKUTEN_REFERER "
+                           "を設定してください。ここでの入力はこのセッション限りの"
+                           "応急処置です。値は "
+                           "webservice.rakuten.co.jp/app/list で確認できます。")
+                if not app_id:
+                    key_in = st.text_input("楽天 applicationId（App ID）",
+                                           value="", type="password",
+                                           key="app_id_input")
+                    if key_in:
+                        st.session_state["rakuten_app_id"] = key_in.strip()
+                        app_id = key_in.strip()
+                if not access_key:
+                    ak_in = st.text_input("楽天 accessKey（Access Key）",
+                                          value="", type="password",
+                                          key="access_key_input")
+                    if ak_in:
+                        st.session_state["rakuten_access_key"] = ak_in.strip()
+                        access_key = ak_in.strip()
+                if not referer:
+                    rf_in = st.text_input(
+                        "呼び出し元サイトURL（Referer）", value="",
+                        placeholder="https://xxxx.streamlit.app/",
+                        key="referer_input",
+                        help="楽天のアプリ設定「許可されたWebサイト」に登録したURL。")
+                    if rf_in:
+                        st.session_state["rakuten_referer"] = rf_in.strip()
+                        referer = rf_in.strip()
 
         kw = st.text_input("ゴルフ場名で検索", key="search_keyword",
                            placeholder="例: 霞ヶ関カンツリー")
@@ -2104,6 +2789,86 @@ with tab3:
 # --- タブ4: ラウンド履歴 ---
 with tab4:
     st.header("ラウンド履歴")
+
+    # ===== プレーヤー名の統合・修正 =====
+    # OCRの誤読（蓑輪→養輪 等）や、呼び名と本名の混在で同じ人が別人として
+    # 記録されてしまうため、全ラウンドをまたいで名前を付け替える。
+    with st.expander("👤 プレーヤー名の統合・修正"):
+        counts = player_round_counts()
+        if not counts:
+            st.info("ラウンドデータがありません。")
+        else:
+            st.caption("同じ人が違う名前で登録されている場合、ここで1つに"
+                       "まとめられます。全ラウンドをまとめて書き換えます。")
+            st.dataframe(pd.DataFrame({
+                "登録名": list(counts.keys()),
+                "ラウンド数": list(counts.values()),
+            }), use_container_width=True, hide_index=True)
+
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                old_nm = st.selectbox("まとめたい名前（消える方）",
+                                      list(counts.keys()), key="rn_old")
+            with rc2:
+                cand = [n for n in counts if n != old_nm]
+                new_mode = st.radio("まとめ先", ["既存の名前から選ぶ", "新しく入力する"],
+                                    horizontal=True, key="rn_mode")
+                if new_mode == "既存の名前から選ぶ" and cand:
+                    new_nm = st.selectbox("まとめ先の名前（残る方）", cand,
+                                          key="rn_new_pick")
+                else:
+                    new_nm = st.text_input("まとめ先の名前（残る方）",
+                                           key="rn_new_text")
+
+            if old_nm and new_nm and old_nm != new_nm:
+                st.warning(f"「{old_nm}」（{counts.get(old_nm, 0)}ラウンド）を "
+                           f"**「{new_nm}」** に付け替えます。元に戻せません。")
+                if st.checkbox("内容を確認しました", key="rn_confirm"):
+                    if st.button("👤 名前を付け替える", type="primary",
+                                 key="rn_go"):
+                        res = rename_player(old_nm, new_nm)
+                        if res["changed"]:
+                            st.success(f"{res['changed']} ラウンドを"
+                                       f"「{new_nm}」に付け替えました。")
+                        else:
+                            st.info("付け替え対象がありませんでした。")
+                        if res["conflicts"]:
+                            st.error(
+                                "次のラウンドは同じ人が二重に記録されている可能性が"
+                                "あるため付け替えていません（ラウンドID: "
+                                + ", ".join(str(i) for i in res["conflicts"])
+                                + "）。下の履歴で中身を確認してください。")
+                        st.rerun()
+
+            # ----- 名前ごと消す（誤登録・使わなくなった呼び名の整理）-----
+            st.divider()
+            st.markdown("**この名前を消す**")
+            st.caption("誤って登録した名前や、使わなくなった呼び名を一覧から消します。"
+                       "その人のスコアも一緒に消えるため、本人の記録が入っている"
+                       "名前は上の「付け替え」を使ってください。")
+            del_nm = st.selectbox("消す名前", list(counts.keys()), key="dp_name")
+            where = player_rounds_of(del_nm) if del_nm else []
+            if where:
+                st.dataframe(pd.DataFrame([{
+                    "ID": w["id"], "日付": w["date"],
+                    "コース": w["course_name"], "スコア": w["total"],
+                } for w in where]), use_container_width=True, hide_index=True)
+                st.warning(f"「{del_nm}」を {len(where)} ラウンドから取り除きます。"
+                           "そのラウンドの他の人の記録は残ります。元に戻せません。")
+            else:
+                st.info(f"「{del_nm}」はラウンドに記録がありません。"
+                        "一覧から消えるだけです。")
+            if st.checkbox("消してよいことを確認しました", key="dp_confirm"):
+                if st.button("🗑️ この名前を消す", key="dp_go"):
+                    res = forget_player(del_nm)
+                    st.success(f"「{del_nm}」を {res['changed']} ラウンドから"
+                               "取り除きました。")
+                    if res["emptied"]:
+                        st.error("次のラウンドはプレーヤーが0人になりました"
+                                 "（ラウンドID: "
+                                 + ", ".join(str(i) for i in res["emptied"])
+                                 + "）。不要なら下の履歴から削除してください。")
+                    st.rerun()
 
     rounds = load_rounds()
     if not rounds:

@@ -18,6 +18,8 @@ _FILES = {
     "courses": os.path.join(DATA_DIR, "courses.json"),
     "rounds": os.path.join(DATA_DIR, "rounds.json"),
     "prefs": os.path.join(DATA_DIR, "prefs.json"),
+    # ライブ観戦用のスナップショット（ラウンド中に何度も上書きされる作業領域）
+    "live": os.path.join(DATA_DIR, "live.json"),
 }
 
 _engine = None
@@ -332,6 +334,156 @@ def update_round(round_id, **fields):
             r.update(fields)
             break
     _store("rounds", rounds)
+
+
+def rename_player(old_name, new_name):
+    """全ラウンドのプレーヤー名を付け替える（統合したい場合は既存名を new_name に指定）。
+
+    同じラウンドに old_name と new_name の両方がいる場合は、同一人物が二重に
+    記録されていることになるため付け替えず、そのラウンドIDを返して人が判断する。
+
+    Returns: dict {"changed": 付け替えたラウンド数, "conflicts": [ラウンドid...]}
+    """
+    old_name = (old_name or "").strip()
+    new_name = (new_name or "").strip()
+    if not old_name or not new_name or old_name == new_name:
+        return {"changed": 0, "conflicts": []}
+    rounds = load_rounds()
+    changed, conflicts = 0, []
+    for r in rounds:
+        names = [p.get("name") for p in r.get("players", [])]
+        if old_name not in names:
+            continue
+        if new_name in names:
+            conflicts.append(r.get("id"))
+            continue
+        for p in r["players"]:
+            if p.get("name") == old_name:
+                p["name"] = new_name
+        # 名前をキーに持つ付随データも合わせて付け替える
+        for fld in ("olympic", "olympic_medals", "raw_hdcp", "ty_handicaps"):
+            d = r.get(fld)
+            if isinstance(d, dict) and old_name in d:
+                d[new_name] = d.pop(old_name)
+        bg = r.get("bg")
+        if isinstance(bg, dict):
+            ph = bg.get("player_hdcps")
+            if isinstance(ph, dict) and old_name in ph:
+                ph[new_name] = ph.pop(old_name)
+            ov = bg.get("override")
+            if isinstance(ov, dict):
+                for tk in ("teamA", "teamB"):
+                    if isinstance(ov.get(tk), list):
+                        ov[tk] = [new_name if n == old_name else n for n in ov[tk]]
+        lv = r.get("lasvegas")
+        if isinstance(lv, dict) and isinstance(lv.get("team1"), list):
+            lv["team1"] = [new_name if n == old_name else n for n in lv["team1"]]
+        changed += 1
+    if changed:
+        _store("rounds", rounds)
+    return {"changed": changed, "conflicts": conflicts}
+
+
+# ---------- ライブ観戦（同伴者がスマホで途中経過を見るための共有領域） ----------
+def save_live(live_id, payload):
+    """ライブ観戦用のスナップショットを保存する。
+
+    ラウンド本体(rounds)とは別のキーに置く。ラウンド中は何度も上書きされるため、
+    確定データである rounds を汚さないように分けている。
+    """
+    live = _load("live", {}) or {}
+    live[str(live_id)] = payload
+    # 古いものが溜まらないよう、更新時刻の新しい順に10件だけ残す
+    if len(live) > 10:
+        keep = sorted(live.items(),
+                      key=lambda kv: (kv[1] or {}).get("updated_at", ""),
+                      reverse=True)[:10]
+        live = dict(keep)
+    _store("live", live)
+
+
+def load_live(live_id):
+    """ライブ観戦用スナップショットを1件読む。無ければ None。"""
+    live = _load("live", {}) or {}
+    return live.get(str(live_id))
+
+
+def clear_live(live_id):
+    live = _load("live", {}) or {}
+    if str(live_id) in live:
+        live.pop(str(live_id))
+        _store("live", live)
+
+
+def player_rounds_of(name):
+    """その名前が出てくるラウンドを [{id, date, course_name, total}] で返す。"""
+    out = []
+    for r in load_rounds():
+        for p in r.get("players", []):
+            if p.get("name") == name:
+                out.append({
+                    "id": r.get("id"), "date": r.get("date"),
+                    "course_name": r.get("course_name"),
+                    "total": sum(p.get("scores") or []),
+                })
+    return sorted(out, key=lambda x: x["date"] or "", reverse=True)
+
+
+def forget_player(name):
+    """指定プレーヤーを全ラウンドと設定の記憶から取り除く。
+
+    そのラウンドの他のプレーヤーの記録は残す。取り除いた結果プレーヤーが
+    0人になるラウンドは削除せず、IDを返して人が判断する。
+
+    Returns: dict {"changed": 取り除いたラウンド数, "emptied": [ラウンドid...]}
+    """
+    name = (name or "").strip()
+    if not name:
+        return {"changed": 0, "emptied": []}
+    rounds = load_rounds()
+    changed, emptied = 0, []
+    for r in rounds:
+        players = r.get("players") or []
+        if not any(p.get("name") == name for p in players):
+            continue
+        r["players"] = [p for p in players if p.get("name") != name]
+        for fld in ("olympic", "olympic_medals", "raw_hdcp", "ty_handicaps"):
+            d = r.get(fld)
+            if isinstance(d, dict):
+                d.pop(name, None)
+        bg = r.get("bg")
+        if isinstance(bg, dict):
+            ph = bg.get("player_hdcps")
+            if isinstance(ph, dict):
+                ph.pop(name, None)
+        lv = r.get("lasvegas")
+        if isinstance(lv, dict) and isinstance(lv.get("team1"), list):
+            lv["team1"] = [n for n in lv["team1"] if n != name]
+        changed += 1
+        if not r["players"]:
+            emptied.append(r.get("id"))
+    if changed:
+        _store("rounds", rounds)
+
+    # 設定側の記憶（HDCPなど）からも消す
+    prefs = load_prefs()
+    ph = prefs.get("player_hdcps")
+    if isinstance(ph, dict) and name in ph:
+        ph.pop(name, None)
+        prefs["player_hdcps"] = ph
+        save_prefs(prefs)
+    return {"changed": changed, "emptied": emptied}
+
+
+def player_round_counts():
+    """プレーヤー名ごとのラウンド数（統合対象を選ぶときの判断材料）。"""
+    counts = {}
+    for r in load_rounds():
+        for p in r.get("players", []):
+            n = p.get("name")
+            if n:
+                counts[n] = counts.get(n, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 # ---------- 集計ヘルパー ----------

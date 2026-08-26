@@ -15,7 +15,12 @@ DEFAULT_RULES = {
     "olympic": {"金": 4, "銀": 3, "銅": 2, "鉄": 1, "チップイン": 5},
     # ポイントターニー: パーとの差ごとの配点
     "point": {"eagle": 4, "birdie": 2, "par": 1, "bogey": 0, "double": -1},
+    # 特別ポイント（オリンピックのメダルとは別枠。同じホールで同時に成立する）
+    "extra": {"ドラコン": 4, "ニアピン": 4, "3パット": -1},
 }
+
+# 特別ポイントの項目（ホール単位で1人が取るもの）
+EXTRA_HOLE_AWARDS = ["ドラコン", "ニアピン"]
 
 
 def point_tourney_results(players, pars, rule, num_holes=18, played_count=None):
@@ -47,29 +52,105 @@ def point_tourney_results(players, pars, rule, num_holes=18, played_count=None):
     return totals, per_hole
 
 
-def las_vegas_number(s1, s2):
-    """2人のスコアを「少ない方=10の位、多い方=1の位」で数値化する。"""
+def las_vegas_number(s1, s2, reverse=False, drop_ones=False):
+    """2人のスコアを1つの数値にする。
+
+    基本: 少ない方=10の位、多い方=1の位（例 4と5 → 45）。
+    reverse=True: 多い方=10の位、少ない方=1の位（例 4と5 → 54）。
+      相手チームにバーディが出たときの「逆転」で使う。
+    drop_ones=True: 1の位を切り捨てる（例 57 → 50）。
+    """
     lo, hi = min(s1, s2), max(s1, s2)
-    return lo * 10 + hi
+    n = (hi * 10 + lo) if reverse else (lo * 10 + hi)
+    if drop_ones:
+        n = (n // 10) * 10
+    return n
+
+
+# チーム分けの方式（選択式）
+LV_TEAM_MODES = ["固定", "3ホールごとに入れ替え"]
+
+
+def lv_pairings(players):
+    """4人から作れる3通りのペア分けを、打順の並び順で返す。"""
+    a, b, c, d = players
+    return [([a, b], [c, d]), ([a, c], [b, d]), ([a, d], [b, c])]
+
+
+def lv_teams_for_hole(hole_index, team_mode, players=None, team1=None,
+                      team2=None):
+    """そのホールのチーム分けを返す。
+    "3ホールごとに入れ替え" は3ホール単位で3通りのペアを巡回する。
+    """
+    if team_mode == "3ホールごとに入れ替え" and players and len(players) == 4:
+        return lv_pairings(players)[(hole_index // 3) % 3]
+    return list(team1 or []), list(team2 or [])
 
 
 def las_vegas_results(team1, team2, scores_by_name, num_holes=18,
-                      played_count=None):
+                      played_count=None, pars=None, players=None,
+                      team_mode="固定", birdie_reverse=False,
+                      drop_ones=False, carry=False, push_by_hole=None):
     """ラスベガス（2対2）。各チームの2人スコアを数値化し、差を勝ち点とする。
-    Returns: dict net1, net2, per_hole[{hole,n1,n2,diff}]
+
+    オプション（いずれも既定OFF。使うものだけ選ぶ）:
+      birdie_reverse: バーディ逆転。あるチームにバーディ以上が出たら、
+        **相手チーム**の数値を反転させる（相手が不利になる）。pars が必要。
+      drop_ones: 1の位切り捨て（57→50）。
+      carry: 同点だったホールの分を次のホールへ持ち越し、倍率を上げる
+        （同点1回で次が2倍、連続すると3倍…）。
+      push_by_hole: {ホールindex: 倍率} の宣言（2 または 4）。
+
+    Returns: dict net1, net2, per_hole[...]
     """
     cnt = num_holes if played_count is None else played_count
+    push_by_hole = push_by_hole or {}
     net1 = 0
     per_hole = []
+    carry_mult = 1
+    # チームを入れ替える方式では、チーム単位の合計に意味がなくなるため
+    # プレーヤー別の増減も同時に集計する。
+    by_player = {n: 0 for n in (players or (list(team1 or []) + list(team2 or [])))}
     for h in range(cnt):
-        n1 = las_vegas_number(scores_by_name[team1[0]][h],
-                              scores_by_name[team1[1]][h])
-        n2 = las_vegas_number(scores_by_name[team2[0]][h],
-                              scores_by_name[team2[1]][h])
+        t1, t2 = lv_teams_for_hole(h, team_mode, players, team1, team2)
+        if len(t1) != 2 or len(t2) != 2:
+            continue
+        s1a, s1b = scores_by_name[t1[0]][h], scores_by_name[t1[1]][h]
+        s2a, s2b = scores_by_name[t2[0]][h], scores_by_name[t2[1]][h]
+
+        b1 = b2 = False
+        if birdie_reverse and pars and h < len(pars):
+            b1 = min(s1a, s1b) <= pars[h] - 1
+            b2 = min(s2a, s2b) <= pars[h] - 1
+
+        # 自分たちのバーディで「相手の」数値が反転する
+        n1 = las_vegas_number(s1a, s1b, reverse=b2, drop_ones=drop_ones)
+        n2 = las_vegas_number(s2a, s2b, reverse=b1, drop_ones=drop_ones)
+
         diff = n2 - n1  # チーム1が小さい(良い)ほどプラス
-        net1 += diff
-        per_hole.append({"hole": h + 1, "n1": n1, "n2": n2, "diff": diff})
-    return {"net1": net1, "net2": -net1, "per_hole": per_hole}
+        push_mult = int(push_by_hole.get(h, 1) or 1)
+        mult = carry_mult * push_mult
+
+        if diff == 0 and carry:
+            gain = 0
+            carry_mult += 1          # 次のホールへ持ち越して倍率を上げる
+        else:
+            gain = diff * mult
+            carry_mult = 1
+        net1 += gain
+        for n in t1:
+            by_player[n] = by_player.get(n, 0) + gain
+        for n in t2:
+            by_player[n] = by_player.get(n, 0) - gain
+
+        per_hole.append({
+            "hole": h + 1, "t1": list(t1), "t2": list(t2),
+            "n1": n1, "n2": n2, "diff": diff,
+            "birdie1": b1, "birdie2": b2,
+            "mult": mult, "gain": gain,
+        })
+    return {"net1": net1, "net2": -net1, "per_hole": per_hole,
+            "by_player": by_player}
 
 # オリンピックのメダル選択肢（入力用）
 OLYMPIC_MEDALS = ["なし", "鉄", "銅", "銀", "金", "チップイン"]
@@ -302,6 +383,38 @@ def olympic_points_from_medals(medals_by_player, olympic_rule):
     }
 
 
+def extra_points(players, num_holes, rule, awards_by_hole=None,
+                 threeputt=None, played_count=None):
+    """特別ポイントを集計する。オリンピックのメダルとは別枠で加算される。
+
+    awards_by_hole: {"ドラコン": {ホールindex: 取得者名}, "ニアピン": {...}}
+      ドラコン・ニアピンは1ホールにつき1人なので、ホールをキーに取得者を持つ。
+    threeputt: {名前: [bool, ...]} 3パットしたホール。ローカルルールのため
+      パット数からの自動判定はせず、手入力で受け取る。
+
+    Returns: (totals {名前: 合計}, per_hole {名前: [ホール別ポイント...]})
+    """
+    awards_by_hole = awards_by_hole or {}
+    threeputt = threeputt or {}
+    cnt = num_holes if played_count is None else played_count
+    per_hole = {n: [0] * num_holes for n in players}
+    for award in EXTRA_HOLE_AWARDS:
+        pt = int(rule.get(award, 0))
+        for h, who in (awards_by_hole.get(award) or {}).items():
+            h = int(h)
+            if who in per_hole and 0 <= h < num_holes:
+                per_hole[who][h] += pt
+    tp = int(rule.get("3パット", 0))
+    for n, flags in threeputt.items():
+        if n not in per_hole:
+            continue
+        for h, on in enumerate(flags or []):
+            if on and h < num_holes:
+                per_hole[n][h] += tp
+    totals = {n: sum(v[:cnt]) for n, v in per_hole.items()}
+    return totals, per_hole
+
+
 def olympic_totals(olympic_points):
     """オリンピック: 各プレーヤーのホール別ポイント合計。
     olympic_points: {name: [hole points...]}
@@ -349,7 +462,19 @@ GAME_GUIDE = {
         "- 各チームの2人のスコアを『少ない方=10の位、多い方=1の位』で数値化。\n"
         "  例：4と5 → 45、5と6 → 56。\n"
         "- 2チームの数値の差が、そのホールの勝ち点（小さいチームが獲得）。\n"
-        "- 18H（またはハーフ）の合計で勝負。ギャンブル性が高めです。"
+        "- 18H（またはハーフ）の合計で勝負。ギャンブル性が高めです。\n\n"
+        "**チーム分け（選択式）**\n"
+        "- 固定：全ホール同じ組み合わせ。\n"
+        "- 3ホールごとに入れ替え：3ホール単位で3通りのペアを順に回します。\n\n"
+        "**オプション（使うものだけ選ぶ）**\n"
+        "- **バーディ逆転**：自分のチームにバーディ以上が出ると、"
+        "*相手チーム*の数値がひっくり返ります（少ない方が1の位になる＝相手が不利）。\n"
+        "  例：相手が5と7で通常57 → 逆転して75。差が一気に開きます。\n"
+        "- **1の位切り捨て**：数値の1の位を切り捨てます（57→50、46→40）。\n"
+        "- **キャリー**：同点だったホールは勝ち点ゼロで持ち越し、"
+        "次のホールが2倍になります（連続で同点なら3倍…）。\n"
+        "- **プッシュ**：宣言したホールの勝ち点が2倍（2人が宣言すると4倍）。"
+        "ホールごとに選びます。"
     ),
     "ベスト＆グロス": (
         "**ベスト＆グロス（4人チーム戦・ヨコの一種）**\n\n"

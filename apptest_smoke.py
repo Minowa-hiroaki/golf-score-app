@@ -18,7 +18,7 @@ tmp = tempfile.mkdtemp()
 import data_manager as dm
 dm.DATA_DIR = tmp
 dm._FILES = {k: os.path.join(tmp, f"{k}.json")
-             for k in ("courses", "rounds", "prefs")}
+             for k in ("courses", "rounds", "prefs", "live")}
 dm._cache.clear()
 
 # テスト用コース（HDCP・ティー付き 18H）を1件用意
@@ -84,6 +84,14 @@ def set_player_name(at, idx, name):
     raise AssertionError(f"player_name_{idx} が見つからない")
 
 
+def ss_get(at, key, default=None):
+    """AppTest の session_state は .get() を持たないため、KeyError を吸収する。"""
+    try:
+        return at.session_state[key]
+    except (KeyError, AttributeError):
+        return default
+
+
 def click_save(at):
     for b in at.button:
         if "スコアを保存" in (b.label or ""):
@@ -133,15 +141,88 @@ def case_putts(at):
         if cb.key == "record_putts":
             cb.set_value(True)
     at.run()
-    # パット入力欄(putt_0_0..)が存在することを確認
-    putt_keys = [ni.key for ni in at.number_input
-                 if str(ni.key).startswith("putt_0_")]
-    assert len(putt_keys) >= 9, f"パット入力欄が不足: {len(putt_keys)}"
+    # パット入力はボタン方式（1〜5）。現在ホール分のボタンが出ていること
+    ptbtns = [b.key for b in at.button if str(b.key).startswith("ptbtn_0_0_")]
+    assert len(ptbtns) == 5, f"パットボタンが5個でない: {ptbtns}"
+    at.button(key="ptbtn_0_0_2").click()
+    at.run()
+    assert at.session_state["putt_0_0"] == 2, "パットが記録されていない"
     click_save(at)
     at.run()
 
 
 run_case("パット記録ON・保存", case_putts)
+
+print("== ホール単位入力（パー基準ボタン）==")
+
+
+def case_hole_ui(at):
+    at.text_input(key="player_name_0").set_value("私")
+    at.run()
+    # H1 は Par4 → ボタンは 3,4,5,6,7 の5個
+    keys = sorted(b.key for b in at.button if str(b.key).startswith("scbtn_0_0_"))
+    assert len(keys) == 5, f"H1のスコアボタンが5個でない: {keys}"
+    # 未入力のうちは scored_ が立っていない
+    assert not ss_get(at, "scored_0_0"), "入力前なのに入力済みになっている"
+    # パー(4)を押す
+    at.button(key="scbtn_0_0_4").click()
+    at.run()
+    assert at.session_state["score_0_0"] == 4, "スコアが入っていない"
+    assert at.session_state["scored_0_0"] is True, "入力済みになっていない"
+    # 1人なのでこのホールは全員完了 → 自動で次のホールへ
+    assert at.session_state["cur_hole"] == 1, \
+        f"自動で次のホールへ進んでいない: {at.session_state['cur_hole']}"
+    # H2 は「…」から7打以上を直接入力できる
+    at.button(key="othbtn_0_1").click()
+    at.run()
+    at.number_input(key="othnum_0_1").set_value(9)
+    at.run()
+    assert at.session_state["score_0_1"] == 9, "「…」からの直接入力が効いていない"
+    assert at.session_state["scored_0_1"] is True
+    # スルーは入力済みホール数に自動追従する
+    assert ss_get(at, "_done_holes") == 2, \
+        f"入力済みホール数が合わない: {ss_get(at, '_done_holes')}"
+    click_save(at)
+    at.run()
+
+
+run_case("ホール単位入力・保存", case_hole_ui)
+
+print("== 観戦モード（?live=xxxx）==")
+
+
+def case_live_view(at_unused):
+    dm.save_live("testlive", {
+        "live_id": "testlive", "updated_at": "2026-08-27T10:00:00",
+        "date": "2026-08-27", "course_name": "テストCC", "tee": "Regular",
+        "pars": course["pars"], "num_holes": 18, "through": 9,
+        "players": [
+            {"name": "私", "scores": [4] * 18, "entered": [True] * 9 + [False] * 9},
+            {"name": "Aさん", "scores": [5] * 18,
+             "entered": [True] * 9 + [False] * 9}],
+        "standings": {"tate": {"私": 9, "Aさん": -9},
+                      "yoko": {"私": 9, "Aさん": -9}},
+    })
+    v = AppTest.from_file("app.py", default_timeout=60)
+    v.query_params["live"] = "testlive"
+    v.run()
+    assert not v.exception, f"観戦ページで例外: {v.exception}"
+    titles = [t.value for t in v.title]
+    assert any("ライブスコア" in str(t) for t in titles), f"見出しが無い: {titles}"
+    # 編集用タブ（スコア入力など）が出ていないこと＝読み取り専用
+    labels = [str(b.label) for b in v.button]
+    assert not any("スコアを保存" in l for l in labels), \
+        f"観戦ページに保存ボタンが出ている: {labels}"
+    subs = [str(x.value) for x in v.subheader]
+    assert any("テストCC" in x for x in subs), f"コース名が出ていない: {subs}"
+    caps = " ".join(str(c.value) for c in v.caption)
+    assert "スルー 9 / 18" in caps, f"スルー表示が無い: {caps}"
+    assert len(v.dataframe) >= 2, "スコア表または順位表が出ていない"
+    assert not any("ゴルフスコア集計" in str(t.value) for t in v.title), \
+        "観戦ページに編集用アプリの見出しが出ている"
+
+
+run_case("観戦モード描画", case_live_view)
 
 print("== 2人 + タテ/ヨコ + ハンデ ==")
 

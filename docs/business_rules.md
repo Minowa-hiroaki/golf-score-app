@@ -43,7 +43,18 @@
 - ポイントターニー配点: `パー差<=-2`→eagle=4／`-1`→birdie=2／`0`→par=1／`+1`→bogey=0／`+2以上`→double=-1
   - 根拠: games.py DEFAULT_RULES（L17）、point_tourney_results pts（L26-35）
 - ラスベガス: 2人のスコアを「少ない方×10+多い方」で数値化し、チーム間の差を勝ち点にする
-  - 根拠: games.py las_vegas_number（L50-53）、las_vegas_results（L56-72）
+  - 根拠: games.py las_vegas_number / las_vegas_results
+- ラスベガスのチーム分けは選択式。`固定` / `3ホールごとに入れ替え`（3ホール単位で
+  (1-2,3-4)→(1-3,2-4)→(1-4,2-3) を巡回）。入れ替え方式では合計をプレーヤー別に集計する
+  - 根拠: games.py LV_TEAM_MODES / lv_pairings / lv_teams_for_hole / by_player
+- ラスベガスのオプション（既定はすべてOFF）:
+  - `バーディ逆転`: 自チームにパー−1以下が出たら **相手チーム** の数値を反転（多い方×10+少ない方）
+  - `1の位切り捨て`: 各チームの数値の1の位を0にする（57→50）
+  - `キャリー`: 差が0のホールは勝ち点0で持ち越し、次ホールの倍率を+1（2倍→3倍…）。差が付いた時点で倍率は1に戻る
+  - `プッシュ`: 宣言したホールの倍率を2倍（2人宣言なら4倍）。ホール番号を選択式で指定
+  - 根拠: games.py las_vegas_results の birdie_reverse / drop_ones / carry / push_by_hole
+  - 出典: enjoy-golfer.com「ゴルフのラスベガスの計算方法を徹底解説！」の数値例
+    （チームX 5・7 が相手のバーディで 57→75、チームY 3・6 は 36、差 39）で検算済み
 - ハンデ配分: コースHDCPの難しい順にホールへ1打ずつ、18超は2巡目
   - 根拠: games.py allocate_strokes（L78-80）
 - スコア入力タブの「ハンデの決め方」の既定は **「ハンデなし」**（index=2）。ハンデ戦のときだけ切り替える
@@ -69,6 +80,10 @@
 
 - c_id の抽出: `数字のみ`→そのまま／`URL内 c_id/(\d+)`→抽出／`4〜7桁数字`→抽出、いずれも不可ならNone
   - 根拠: course_search.py extract_cid（L28-39）
+- APIキー・accessKey・Refererが secrets / 環境変数 で揃っている場合、画面には入力欄を出さず
+  「設定済み」の表示だけにする。欠けている項目だけ応急入力欄を出す（OpenAIキーも同様）
+  - 根拠: app.py 楽天の missing 判定、_render_image_ocr のキー分岐
+  - 理由: 伏字でも肩越しに見える／セッションに残る／誤操作で消えるため、常設しない
 - 各ホールのPar/ヤードはAPIではなくレイアウトページ（layout_disp URL）のスクレイピングで取得
   - 根拠: course_search.py 冒頭docstring（L7-9）、LAYOUT_URL_TMPL
 - ゴルフ場検索APIのエンドポイントは `https://openapi.rakuten.co.jp/engine/api/Gora/GoraGolfCourseSearch/20170623`。

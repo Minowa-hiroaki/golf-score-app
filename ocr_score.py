@@ -22,8 +22,16 @@ NAME_ALIASES = {
     "蓑輪 宏晃": "hiroaki minowa",
     "蓑輪宏晃": "hiroaki minowa",
     "蓑輪": "hiroaki minowa",
-    # 「蓑」は難読でVisionが誤読しやすい（実測: 蓑輪→義輪）。既知の誤読を吸収する。
+    # 「蓑」は難読でVisionが誤読しやすい。既知の誤読を吸収する。
+    # 実測: 蓑輪→義輪 / 養輪 / 豊嶋（2026-08-26 東急セブンハンドレッドで発生）
     "義輪": "hiroaki minowa",
+    "養輪": "hiroaki minowa",
+    "養輪 宏晃": "hiroaki minowa",
+    "養輪宏晃": "hiroaki minowa",
+    "豊嶋": "hiroaki minowa",
+    "豊嶋 宏晃": "hiroaki minowa",
+    "豊嶋宏晃": "hiroaki minowa",
+    "蓑輪 宏晃": "hiroaki minowa",
     "みのわ": "hiroaki minowa",
     "hiroaki minowa": "hiroaki minowa",
 }

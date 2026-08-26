@@ -1,0 +1,6 @@
+# .bat / .cmd は必ず CRLF で取り出す。
+# LF だけの .bat を cmd.exe が読むとバイト位置がずれ、エラーにならず一部の行を
+# 黙って飛ばす（.venv 作成ブロックが丸ごと飛ぶ実害あり）。
+# 由来: bat-scripts スキル BAT-3b
+*.bat text eol=crlf
+*.cmd text eol=crlf
