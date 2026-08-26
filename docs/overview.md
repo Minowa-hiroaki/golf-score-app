@@ -18,7 +18,7 @@ Google Sheets保存版。data_manager.pyは1セル50,000字上限対策のチャ
 - 6種のゲーム集計: タテ／ヨコ／オリンピック／ポイントターニー／ラスベガス／ベスト＆グロス（根拠: app.py GAME_OPTIONS L21-22、games.py）
 - ハンデ配分（コースHDCPの難しい順に配る allocate_strokes。タテ/ヨコ/ベスト＆グロスに適用）（根拠: games.py allocate_strokes L78、HANDOVER.md §7）
 - 集計分析: Par別傾向・スコア内訳（バーディ/パー/ボギー…）・コース別平均・直近10ラウンド平均パット・同一コースのホール別平均（根拠: data_manager.py get_par_type_stats/get_score_breakdown/get_course_score_averages/get_recent_putt_avg/get_course_hole_averages）
-- 楽天GORA APIによるコース検索＋レイアウトページのスクレイピングでPar/ヤード取得（根拠: course_search.py L1-25）
+- 楽天GORA APIによるコース検索（新基盤 openapi.rakuten.co.jp / applicationId＋accessKey）＋レイアウトページのスクレイピングでPar/ヤード取得。URL・c_id 指定での取り込みはAPIキー不要（根拠: course_search.py RAKUTEN_SEARCH_ENDPOINT・search_rakuten・fetch_holes_from_layout）
 - ゴルフ場タッチパネル画面のスコアOCR（OpenAI Vision。_call_vision 実装済み。モデルは gpt-5.5 / gpt-4o / gpt-4o-mini から選択、既定 gpt-5.5。APIキーは 環境変数OPENAI_API_KEY → st.secrets → 画面入力 の順で解決）（根拠: ocr_score.py _call_vision L225-268、app.py _ocr_api_key L202-210・モデル選択 L228-230）
 - 保存層の自動切替: DB_URLがあればPostgres／Google Sheets設定があればSheets／どちらも無ければローカルJSON（根拠: data_manager.py _backend L128-135）
 - 得点ルール（タテ/ヨコ配点・オリンピック配点・ポイントターニー配点）のprefs保存（根拠: app.py get_rules L25-40、games.py DEFAULT_RULES L12-18）

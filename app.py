@@ -44,17 +44,35 @@ from course_search import (
 )
 
 
-def get_rakuten_app_id():
-    """APIキー(applicationId)を secrets / 環境変数 / 入力欄 から取得"""
+def _secret_or_env(name, session_key):
+    """secrets / 環境変数 / 画面入力 の順に値を探す。前後の空白・改行は除去する。"""
     try:
-        v = st.secrets.get("RAKUTEN_APP_ID")
+        v = st.secrets.get(name)
         if v:
-            return v
+            return str(v).strip()
     except Exception:
         pass
-    if os.environ.get("RAKUTEN_APP_ID"):
-        return os.environ["RAKUTEN_APP_ID"]
-    return st.session_state.get("rakuten_app_id", "")
+    if os.environ.get(name):
+        return os.environ[name].strip()
+    return str(st.session_state.get(session_key, "")).strip()
+
+
+def get_rakuten_app_id():
+    """楽天 applicationId を secrets / 環境変数 / 入力欄 から取得"""
+    return _secret_or_env("RAKUTEN_APP_ID", "rakuten_app_id")
+
+
+def get_rakuten_access_key():
+    """楽天 accessKey を secrets / 環境変数 / 入力欄 から取得。
+    2026年2月の楽天ウェブサービス刷新で applicationId と併せて必須になった。"""
+    return _secret_or_env("RAKUTEN_ACCESS_KEY", "rakuten_access_key")
+
+
+def get_rakuten_referer():
+    """楽天アプリに登録した「許可されたWebサイト」のURL。
+    新基盤は呼び出し元サイトを見るため、サーバー側からの呼び出しでは
+    Referer/Origin を自分で付けないと 403 になる。"""
+    return _secret_or_env("RAKUTEN_REFERER", "rakuten_referer")
 
 
 def hole_columns(num_holes):
@@ -729,7 +747,10 @@ with tab1:
                         hmode = st.radio(
                             "ハンデの決め方",
                             ["HDCPを入力して自動", "手動で設定", "ハンデなし"],
-                            key="hcap_mode", horizontal=True)
+                            index=2, key="hcap_mode", horizontal=True,
+                            help="既定は「ハンデなし」。ハンデ戦のときだけ左の2つに切り替えてください。")
+                        if hmode == "ハンデなし":
+                            st.caption("全員ハンデ0（グロスのまま）で集計します。")
                         if hmode != "ハンデなし":
                             hc = st.columns(len(players))
                             for col, n in zip(hc, players):
@@ -1788,24 +1809,46 @@ with tab3:
     # === 方法1: 楽天GORA API 名前検索 ===
     if add_method.startswith("🌐"):
         app_id = get_rakuten_app_id()
-        with st.expander("⚙️ APIキー設定（楽天 applicationId）", expanded=not bool(app_id)):
-            st.caption("楽天ウェブサービス(webservice.rakuten.co.jp)で無料取得した "
-                       "applicationId を入力してください。一度入力すれば保持されます。")
-            key_in = st.text_input("楽天 applicationId", value=app_id,
+        access_key = get_rakuten_access_key()
+        referer = get_rakuten_referer()
+        with st.expander("⚙️ APIキー設定（楽天 applicationId / accessKey）",
+                         expanded=not (app_id and access_key and referer)):
+            st.caption("楽天ウェブサービス(webservice.rakuten.co.jp/app/list)の "
+                       "アプリ情報にある App ID と Access Key を入力してください。"
+                       "2026年2月の基盤刷新以降、両方そろわないと認証できません。"
+                       "一度入力すれば保持されます。")
+            key_in = st.text_input("楽天 applicationId（App ID）", value=app_id,
                                    type="password", key="app_id_input")
             if key_in:
-                st.session_state["rakuten_app_id"] = key_in
-                app_id = key_in
+                st.session_state["rakuten_app_id"] = key_in.strip()
+                app_id = key_in.strip()
+            ak_in = st.text_input("楽天 accessKey（Access Key）", value=access_key,
+                                  type="password", key="access_key_input")
+            if ak_in:
+                st.session_state["rakuten_access_key"] = ak_in.strip()
+                access_key = ak_in.strip()
+            rf_in = st.text_input(
+                "呼び出し元サイトURL（Referer）", value=referer,
+                placeholder="https://xxxx.streamlit.app/", key="referer_input",
+                help="楽天のアプリ設定「許可されたWebサイト(Allowed websites)」に"
+                     "登録したURLと同じものを入れてください。"
+                     "サーバーから呼ぶときは、この情報を自分で付けないと403になります。")
+            if rf_in:
+                st.session_state["rakuten_referer"] = rf_in.strip()
+                referer = rf_in.strip()
 
         kw = st.text_input("ゴルフ場名で検索", key="search_keyword",
                            placeholder="例: 霞ヶ関カンツリー")
         if st.button("🔍 検索", use_container_width=True):
             if not app_id:
-                st.error("APIキー(applicationId)を入力してください。")
+                st.error("applicationId（App ID）を入力してください。")
+            elif not access_key:
+                st.error("accessKey（Access Key）を入力してください。"
+                         "2026年2月の楽天ウェブサービス刷新で必須になりました。")
             elif not kw:
                 st.error("ゴルフ場名を入力してください。")
             else:
-                res = search_rakuten(kw, app_id)
+                res = search_rakuten(kw, app_id, access_key, referer=referer)
                 if isinstance(res, tuple):
                     st.error(res[1])
                     st.session_state["search_results"] = []

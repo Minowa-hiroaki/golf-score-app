@@ -46,6 +46,10 @@
   - 根拠: games.py las_vegas_number（L50-53）、las_vegas_results（L56-72）
 - ハンデ配分: コースHDCPの難しい順にホールへ1打ずつ、18超は2巡目
   - 根拠: games.py allocate_strokes（L78-80）
+- スコア入力タブの「ハンデの決め方」の既定は **「ハンデなし」**（index=2）。ハンデ戦のときだけ切り替える
+  - 根拠: app.py ハンデ設定 expander の st.radio(index=2)
+  - 理由: 既定が「HDCPを入力して自動」だと、prefs に保存済みの player_hdcps が無自覚に適用され、
+    ハンデ無しのつもりでネット集計になる事故が起きるため（ゲーム集計タブは以前から既定「ハンデなし」）
 
 ## 集計分析（data_manager.py）
 
@@ -66,4 +70,16 @@
 - c_id の抽出: `数字のみ`→そのまま／`URL内 c_id/(\d+)`→抽出／`4〜7桁数字`→抽出、いずれも不可ならNone
   - 根拠: course_search.py extract_cid（L28-39）
 - 各ホールのPar/ヤードはAPIではなくレイアウトページ（layout_disp URL）のスクレイピングで取得
-  - 根拠: course_search.py 冒頭docstring（L7-9）、LAYOUT_URL_TMPL（L25）
+  - 根拠: course_search.py 冒頭docstring（L7-9）、LAYOUT_URL_TMPL
+- ゴルフ場検索APIのエンドポイントは `https://openapi.rakuten.co.jp/engine/api/Gora/GoraGolfCourseSearch/20170623`。
+  `applicationId` はクエリ、`accessKey` はHTTPヘッダー（`accessKey: <値>`）で送る。どちらか欠けると 400 になる
+- `RAKUTEN_REFERER` が設定されていれば `Referer` ヘッダーに入れ、その URL の `scheme://host` を
+  `Origin` ヘッダーに入れて送る。未設定だと 403 `REQUEST_CONTEXT_BODY_HTTP_REFERRER_MISSING` になる
+  - 根拠: course_search.py `_origin_of` / search_rakuten のヘッダー組み立て
+  - 根拠: course_search.py RAKUTEN_SEARCH_ENDPOINT / search_rakuten、楽天公式ドキュメント（gora-golf-course-search）
+- `applicationId または accessKey が空` → APIを叩かずエラーメッセージを返す（通信前に弾く）
+  - 根拠: course_search.py search_rakuten 冒頭のガード
+- キーは secrets → 環境変数 → 画面入力 の順に解決し、前後の空白・改行を除去する
+  - 根拠: app.py _secret_or_env / get_rakuten_app_id / get_rakuten_access_key
+- 「URL / ID から取得」はAPIを使わずレイアウトページのスクレイピングのみ。**APIキーが無くても動く**
+  - 根拠: course_search.py fetch_holes_from_layout（APIキーを引数に取らない）

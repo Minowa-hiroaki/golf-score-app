@@ -19,8 +19,12 @@ UA = {
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 }
 
+# 楽天ウェブサービスは2026年2月のインフラ刷新で基盤が移行し、旧ドメイン
+# app.rakuten.co.jp/services/api/ は2026年5月13日で停止した。
+# 新基盤では applicationId に加えて accessKey が必須（ヘッダーまたはクエリ）。
+# 根拠: https://webservice.rakuten.co.jp/documentation/gora-golf-course-search
 RAKUTEN_SEARCH_ENDPOINT = (
-    "https://app.rakuten.co.jp/services/api/Gora/GoraGolfCourseSearch/20170623"
+    "https://openapi.rakuten.co.jp/engine/api/Gora/GoraGolfCourseSearch/20170623"
 )
 LAYOUT_URL_TMPL = "https://booking.gora.golf.rakuten.co.jp/guide/layout_disp/c_id/{cid}/"
 
@@ -39,20 +43,55 @@ def extract_cid(text):
     return None
 
 
-def search_rakuten(keyword, application_id, hits=20):
+def _origin_of(url):
+    """URL から scheme://host だけを取り出す（Origin ヘッダー用）。"""
+    m = re.match(r"^(https?://[^/]+)", (url or "").strip())
+    return m.group(1) if m else None
+
+
+def search_rakuten(keyword, application_id, access_key=None, hits=20,
+                   referer=None):
     """楽天GORA ゴルフ場検索APIでコースを検索する。
+
+    application_id / access_key はどちらも楽天ウェブサービスのアプリ情報ページ
+    (https://webservice.rakuten.co.jp/app/list) で発行される。新基盤では両方必須。
+    accessKey はURLに載せず HTTPヘッダー で送る。
+
+    referer: アプリに登録した「許可されたWebサイト」のURL。新基盤は「どのサイトから
+    呼ばれたか」を見るため、サーバー側からの呼び出しでは Referer / Origin を自分で
+    付けないと 403 REQUEST_CONTEXT_BODY_HTTP_REFERRER_MISSING になる。
 
     Returns: list of dict {golfCourseId, golfCourseName, prefecture, ...}
     エラー時は ("error", メッセージ) を返す。
     """
+    application_id = (application_id or "").strip()
+    access_key = (access_key or "").strip()
+    if not application_id:
+        return ("error", "applicationId が未設定です。")
+    if not access_key:
+        return ("error",
+                "accessKey が未設定です。2026年2月の楽天ウェブサービス刷新以降、"
+                "applicationId だけでは認証できません。"
+                "https://webservice.rakuten.co.jp/app/list でアプリの "
+                "Access Key を確認して設定してください。")
+
     params = {
         "applicationId": application_id,
         "keyword": keyword,
         "hits": hits,
         "format": "json",
     }
+    headers = dict(UA)
+    headers["accessKey"] = access_key
+    referer = (referer or "").strip()
+    if referer:
+        headers["Referer"] = referer
+        origin = _origin_of(referer)
+        if origin:
+            headers["Origin"] = origin
     try:
-        r = requests.get(RAKUTEN_SEARCH_ENDPOINT, params=params, headers=UA, timeout=15)
+        r = requests.get(RAKUTEN_SEARCH_ENDPOINT, params=params,
+                         headers=headers, timeout=15)
     except Exception as e:
         return ("error", f"通信エラー: {e}")
 
@@ -62,7 +101,21 @@ def search_rakuten(keyword, application_id, hits=20):
             msg = err.get("error_description", r.text[:200])
         except Exception:
             msg = r.text[:200]
-        return ("error", f"APIエラー ({r.status_code}): {msg}")
+        body = (r.text or "")
+        hint = ""
+        if "REFERRER" in body.upper() or "REFERER" in body.upper() \
+                or "ORIGIN" in body.upper():
+            hint = ("　→ 呼び出し元サイトの情報(Referer/Origin)が足りません。"
+                    "楽天ウェブサービスのアプリ設定「許可されたWebサイト"
+                    "(Allowed websites)」にドメインを登録し、"
+                    "同じURLを『呼び出し元サイトURL』欄に入れてください。")
+        elif r.status_code in (400, 401):
+            hint = ("　→ applicationId / accessKey の組み合わせをご確認ください"
+                    "（2026年2月の刷新で accessKey が必須になりました）。")
+        elif r.status_code == 403:
+            hint = ("　→ アプリの利用条件（許可サイト・APIの利用可否）を"
+                    "楽天ウェブサービスの管理画面でご確認ください。")
+        return ("error", f"APIエラー ({r.status_code}): {msg}{hint}")
 
     data = r.json()
     items = data.get("Items", [])
