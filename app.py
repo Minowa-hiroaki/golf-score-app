@@ -72,6 +72,21 @@ def get_rakuten_access_key():
     return _secret_or_env("RAKUTEN_ACCESS_KEY", "rakuten_access_key")
 
 
+def get_app_pin():
+    """編集側の暗証番号。secrets / 環境変数 だけを見る。
+
+    _secret_or_env は画面入力(session_state)もフォールバックに使うため、
+    暗証番号には使わない（session_state 経由で値を差し込まれる余地をなくす）。
+    """
+    try:
+        v = st.secrets.get("APP_PIN")
+        if v:
+            return str(v).strip()
+    except Exception:
+        pass
+    return (os.environ.get("APP_PIN") or "").strip()
+
+
 def get_rakuten_referer():
     """楽天アプリに登録した「許可されたWebサイト」のURL。
     新基盤は呼び出し元サイトを見るため、サーバー側からの呼び出しでは
@@ -1033,9 +1048,30 @@ def _render_image_ocr(course_name, course_pars, course_hdcps,
 # ===== 観戦モード =====
 # URLに ?live=xxxx が付いていたら、読み取り専用の観戦ページだけを描いて終了する。
 # 同伴者はQRを読むだけでここに来るので、編集用のタブは一切出さない。
+# ここは暗証番号の対象外（読むだけなので、同伴者に手間をかけさせない）。
 _live_param = st.query_params.get("live")
 if _live_param:
     render_live_viewer(_live_param)
+    st.stop()
+
+
+# ===== 編集側の入口ロック =====
+# 観戦ページを同伴者に見せるにはアプリを公開設定にする必要があるが、
+# そうすると編集画面（保存・削除・名前変更）まで誰でも触れてしまう。
+# secrets に APP_PIN があるときだけ、編集側に暗証番号をかける。
+# 未設定なら今までどおり素通り＝この機能を使わない選択もできる。
+_app_pin = get_app_pin()
+if _app_pin and not st.session_state.get("_unlocked"):
+    st.title("⛳ ゴルフスコア集計")
+    st.caption("編集するには暗証番号が必要です。"
+               "観戦ページ（QRから開くページ）は暗証番号なしで見られます。")
+    _pin_in = st.text_input("暗証番号", type="password", key="pin_input")
+    if _pin_in:
+        if _pin_in.strip() == _app_pin:
+            st.session_state["_unlocked"] = True
+            st.rerun()
+        else:
+            st.error("暗証番号が違います。")
     st.stop()
 
 tab1, tab2, tab5, tab3, tab4 = st.tabs(

@@ -244,6 +244,51 @@ def case_qr(at):
 
 run_case("ライブ共有・QR生成", case_qr)
 
+print("== 編集側の暗証番号ロック ==")
+
+
+def case_pin(at_unused):
+    os.environ["APP_PIN"] = "9876"
+    try:
+        # 1) 暗証番号なしでは編集タブに入れない
+        a = AppTest.from_file("app.py", default_timeout=60)
+        a.run()
+        assert not a.exception, f"例外: {a.exception}"
+        labels = [str(b.label) for b in a.button]
+        assert not any("スコアを保存" in l for l in labels), \
+            "暗証番号なしで編集画面に入れている"
+        keys = [str(t.key) for t in a.text_input]
+        assert "pin_input" in keys, f"暗証番号の入力欄が無い: {keys}"
+
+        # 2) 間違った番号では入れない
+        a.text_input(key="pin_input").set_value("0000")
+        a.run()
+        assert not a.session_state.get("_unlocked") if hasattr(
+            a.session_state, "get") else True
+
+        # 3) 正しい番号なら入れる
+        b = AppTest.from_file("app.py", default_timeout=60)
+        b.run()
+        b.text_input(key="pin_input").set_value("9876")
+        b.run()
+        assert ss_get(b, "_unlocked") is True, "正しい暗証番号で解錠できない"
+        assert not b.exception, f"解錠後に例外: {b.exception}"
+
+        # 4) 観戦ページは暗証番号なしで見られる
+        v = AppTest.from_file("app.py", default_timeout=60)
+        v.query_params["live"] = "testlive"
+        v.run()
+        assert not v.exception, f"観戦ページで例外: {v.exception}"
+        vkeys = [str(t.key) for t in v.text_input]
+        assert "pin_input" not in vkeys, "観戦ページに暗証番号を要求している"
+        assert any("ライブスコア" in str(t.value) for t in v.title), \
+            "観戦ページが描かれていない"
+    finally:
+        os.environ.pop("APP_PIN", None)
+
+
+run_case("暗証番号ロック", case_pin)
+
 print("== 2人 + タテ/ヨコ + ハンデ ==")
 
 
