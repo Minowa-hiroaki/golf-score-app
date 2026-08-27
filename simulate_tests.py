@@ -92,6 +92,17 @@ check(ph["X"] == [pr["eagle"], pr["birdie"], pr["par"], pr["bogey"], pr["double"
       "point 各カテゴリ配点")
 
 # ===== 5. las vegas =====
+print("== QRコード生成 ==")
+from live_share import qr_svg as _qr, milestones as _ms, estimate_units as _eu
+_svg = _qr("https://example.streamlit.app/?live=abc12345")
+check(isinstance(_svg, str) and _svg.lstrip().startswith("<svg"),
+      "qr_svg はSVG文字列を返す（segnoはバイト列で書くのでBytesIO必須）")
+check(_qr("") is None and _qr(None) is None, "空URLならNone")
+check(sorted(_ms("ハーフごと＋最終（おすすめ）", 18)) == [9, 18], "配信ホール(ハーフ)")
+check(sorted(_ms("3ホールごと＋最終", 18)) == [3, 6, 9, 12, 15, 18], "配信ホール(3H)")
+check(_eu("毎ホール（無料枠に注意）", 18, 4) == 72, "通数見積り(毎ホール4人)")
+check(_eu("送らない", 18, 4) == 0, "送らない=0通")
+
 print("== las vegas ==")
 check(las_vegas_number(4, 5) == 45 and las_vegas_number(5, 4) == 45,
       "vegas 数値化(少ない方が十の位)")

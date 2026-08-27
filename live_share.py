@@ -95,16 +95,24 @@ def flash_text(payload, upto_hole, viewer_url=None):
 
 
 def qr_svg(url, scale=6):
-    """URLのQRコードをSVG文字列で返す。segno が無ければ None。"""
+    """URLのQRコードをSVG文字列で返す。作れなければ None（画面は落とさない）。
+
+    注意: segno は SVG を **バイト列** で書き出す。文字列バッファ(StringIO)を
+    渡すと TypeError になる。必ず BytesIO で受けて decode すること。
+    QRはあくまで補助表示なので、何が起きても None を返してアプリは止めない。
+    """
+    if not url:
+        return None
     try:
         import segno
+        import io as _io
+        buf = _io.BytesIO()
+        segno.make(url, error="m").save(buf, kind="svg", scale=scale,
+                                        dark="#e6e9ef", light=None,
+                                        xmldecl=False)
+        return buf.getvalue().decode("utf-8")
     except Exception:
         return None
-    import io as _io
-    buf = _io.StringIO()
-    segno.make(url, error="m").save(buf, kind="svg", scale=scale,
-                                    dark="#e6e9ef", light=None, xmldecl=False)
-    return buf.getvalue()
 
 
 def line_push(token, to, text):

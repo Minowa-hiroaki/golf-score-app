@@ -96,3 +96,22 @@
   Streamlit は例外が出ても画面の途中までは描くため、目視では気づきにくい**
 - 回帰テスト: 観戦モードの描画テストを追加（apptest_smoke.py 10件 PASS / simulate_tests.py 50件 PASS）
 
+## 2026-08-27 QR生成のTypeError（本番で発覚）
+
+- 症状: Streamlit Cloud で `📣 ライブ共有` を開くと TypeError でアプリ全体が停止
+- 原因: `segno` は SVG を **バイト列** で書き出すのに、`io.StringIO()` を渡していた
+- 対応: `io.BytesIO()` で受けて `decode("utf-8")` する。あわせて `qr_svg` 全体を
+  try/except で包み、失敗しても None を返してアプリを止めないようにした
+  （QRは補助表示であり、これのために全機能が落ちるのは割に合わない）
+- **テストが取り逃がした理由**: AppTest 実行時に `APP_BASE_URL` が未設定だったため
+  観戦URLが空になり、`qr_svg` が一度も呼ばれていなかった。ローカル確認時も同様
+- 再発防止:
+  - `apptest_smoke.py` の先頭で `APP_BASE_URL` を設定し、**全ケースがQR生成を通る**ようにした
+  - QRのSVGと観戦URLが実際に描画されているかを確認するケースを追加
+  - `simulate_tests.py` に `qr_svg` の直接検査（SVG文字列を返すこと・空URLでNone）と
+    配信頻度・通数見積りの検査を追加
+- ルール: **省略可能な設定（URL・APIキー等）が未設定だと通らない経路は、
+  テスト側で設定を与えて必ず通す。** 「設定が無いと動かない部分」は
+  テストの死角になりやすい
+- 結果: simulate_tests.py 56件 PASS / apptest_smoke.py 11件 PASS
+

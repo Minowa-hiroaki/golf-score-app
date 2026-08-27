@@ -13,6 +13,10 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 # ファイル保存モードを強制 & データ用一時フォルダ
 os.environ["GOLF_BACKEND"] = "file"
+# 観戦URL・QRの生成経路をテストで必ず通す。
+# これが未設定だとURLが空になり qr_svg が一度も呼ばれず、
+# 2026-08-27 の「segnoにStringIOを渡してTypeError」を取り逃がした。
+os.environ["APP_BASE_URL"] = "https://example.streamlit.app"
 tmp = tempfile.mkdtemp()
 
 import data_manager as dm
@@ -223,6 +227,22 @@ def case_live_view(at_unused):
 
 
 run_case("観戦モード描画", case_live_view)
+
+print("== ライブ共有のQR生成 ==")
+
+
+def case_qr(at):
+    at.text_input(key="player_name_0").set_value("私")
+    at.run()
+    assert not at.exception, f"例外: {at.exception}"
+    # QRのSVGと観戦URLが画面に出ていること
+    body = " ".join(str(m.value) for m in at.markdown)
+    codes = " ".join(str(c.value) for c in at.code)
+    assert "<svg" in body, "QRのSVGが描かれていない"
+    assert "example.streamlit.app/?live=" in codes, f"観戦URLが出ていない: {codes[:200]}"
+
+
+run_case("ライブ共有・QR生成", case_qr)
 
 print("== 2人 + タテ/ヨコ + ハンデ ==")
 
