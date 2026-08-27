@@ -97,6 +97,8 @@ from live_share import qr_svg as _qr, milestones as _ms, estimate_units as _eu
 _svg = _qr("https://example.streamlit.app/?live=abc12345")
 check(isinstance(_svg, str) and _svg.lstrip().startswith("<svg"),
       "qr_svg はSVG文字列を返す（segnoはバイト列で書くのでBytesIO必須）")
+check("#000" in _svg and "#fff" in _svg,
+      "QRは黒×白（反転・透明だと端末のテーマ次第で読めなくなる）")
 check(_qr("") is None and _qr(None) is None, "空URLならNone")
 check(sorted(_ms("ハーフごと＋最終（おすすめ）", 18)) == [9, 18], "配信ホール(ハーフ)")
 check(sorted(_ms("3ホールごと＋最終", 18)) == [3, 6, 9, 12, 15, 18], "配信ホール(3H)")
