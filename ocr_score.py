@@ -9,6 +9,9 @@
       使い、response_format=json_object・モデル別リトライ（gpt-5系は
       max_completion_tokens/reasoning_effort、旧モデルは max_tokens）で呼ぶ。
       APIキーは環境変数 OPENAI_API_KEY → st.secrets → 画面入力 の順で解決する。
+      失敗したときは原因の分かる日本語で RuntimeError を出す（2026-10-17。
+      以前は空文字を返して json.loads の英文エラーになっていた）。
+      送る前に画像を長辺2048pxのJPEGへ縮め、iPhoneの写真の向きを直す。
       parse_vision_json / merge_into_round / verify_half などの純ロジックは
       API呼び出し無しで単体でも使える・テストできる。
 """
@@ -232,19 +235,79 @@ def finalize_scores(scores18):
 # APIキーはこのモジュールでは保持しない。呼び出し側(app.py)が
 #   os.environ["OPENAI_API_KEY"] → st.secrets → サイドバー入力
 # の順で用意した文字列を api_key 引数で渡す（名刺アプリと同じ流儀）。
+#
+# 2026-10-17: 以前は API の例外を全部捨てて空文字を返し、json.loads が
+# 「Expecting value: line 1 column 1 (char 0)」で落ちていた（原因が画面に出ない）。
+# いまは原因の分かる日本語で RuntimeError を出す。app.py はその文をそのまま表示する。
+
+_MAX_SIDE = 2048  # 送る画像の長辺。detail=high はこれ以上送っても読み取り精度は上がらない
+
+
+def _prepare_image(image_bytes: bytes) -> tuple[bytes, str]:
+    """送る前に画像を整える。iPhone の写真の向きを直し、長辺 _MAX_SIDE の JPEG にする。
+    Pillow で開けないときは元のまま送る（MIME は先頭バイトで判定）。
+    Returns: (bytes, mime)"""
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+        im = Image.open(BytesIO(image_bytes))
+        im = ImageOps.exif_transpose(im)
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        im.thumbnail((_MAX_SIDE, _MAX_SIDE), Image.LANCZOS)
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=85)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        head = image_bytes[:8]
+        if head.startswith(b"\x89PNG"):
+            return image_bytes, "image/png"
+        if head[:4] == b"RIFF":
+            return image_bytes, "image/webp"
+        return image_bytes, "image/jpeg"
+
+
+def _explain_api_error(e: Exception) -> str:
+    """OpenAI の例外を、画面に出す日本語へ。元の英文も末尾に付ける（原因を追えるように）。"""
+    name = type(e).__name__
+    msg = str(e)
+    low = msg.lower()
+    if name == "AuthenticationError" or "invalid_api_key" in low or "incorrect api key" in low:
+        head = "OpenAI の APIキーが無効です（期限切れ・削除・貼り間違い）。Streamlit Cloud の Secrets の OPENAI_API_KEY を確かめてください"
+    elif "insufficient_quota" in low or "billing" in low:
+        head = "OpenAI の残高・利用上限に達しています。OpenAI の Billing を確かめてください"
+    elif name == "RateLimitError":
+        head = "OpenAI の呼び出し回数の上限に当たりました。少し待ってからもう一度押してください"
+    elif name == "NotFoundError" or "model_not_found" in low or "does not exist" in low:
+        head = "指定したモデルが使えません（モデル名の誤り、またはこのキーで使えないモデル）"
+    elif name in ("APIConnectionError", "APITimeoutError"):
+        head = "OpenAI に接続できませんでした（通信が不安定）。電波の良い所でもう一度押してください"
+    elif name == "BadRequestError" and ("image" in low or "too large" in low):
+        head = "画像を受け付けてもらえませんでした（形式またはサイズ）"
+    else:
+        head = "OpenAI の呼び出しに失敗しました"
+    return f"{head}（{name}: {msg[:200]}）"
+
+
 def _call_vision(image_bytes: bytes, api_key: str, model: str = "gpt-4o") -> str:
     """画像をVisionに投げ、生テキスト（JSON文字列）を返す。
-    名刺アプリの ocr_image と同じく response_format=json_object・モデル別リトライ。"""
+    名刺アプリの ocr_image と同じく response_format=json_object・モデル別リトライ。
+    全試行が失敗したら、原因の分かる文で RuntimeError を出す（空文字は返さない）。"""
+    key = (api_key or "").strip()
+    if not key:
+        raise RuntimeError("OpenAI の APIキーが設定されていません。Streamlit Cloud の Secrets に OPENAI_API_KEY を入れてください")
+
     from openai import OpenAI
 
-    b64 = base64.standard_b64encode(image_bytes).decode()
-    client = OpenAI(api_key=(api_key or "").strip())
+    data, mime = _prepare_image(image_bytes)
+    b64 = base64.standard_b64encode(data).decode()
+    client = OpenAI(api_key=key)
     messages = [{
         "role": "user",
         "content": [
             {"type": "text", "text": VISION_PROMPT},
             {"type": "image_url",
-             "image_url": {"url": f"data:image/jpeg;base64,{b64}",
+             "image_url": {"url": f"data:{mime};base64,{b64}",
                            "detail": "high"}},
         ],
     }]
@@ -262,20 +325,32 @@ def _call_vision(image_bytes: bytes, api_key: str, model: str = "gpt-4o") -> str
             {"max_completion_tokens": 1500},
             {"max_tokens": 1024},
         ]
-    content = ""
+    last_err = None
     for extra in attempts:
         try:
             resp = client.chat.completions.create(**base, **extra)
-        except Exception:
+        except Exception as e:
+            last_err = e
+            # キー・残高・モデルの誤りは、引数を変えて試し直しても通らない
+            if type(e).__name__ in ("AuthenticationError", "NotFoundError", "PermissionDeniedError") \
+                    or "insufficient_quota" in str(e).lower():
+                break
             continue
         content = (resp.choices[0].message.content or "").strip()
         if content:
-            break
-    return content
+            return content
+        last_err = None  # 呼び出しは通ったが返事が空
+    if last_err is not None:
+        raise RuntimeError(_explain_api_error(last_err))
+    raise RuntimeError("OpenAI から空の返事が返りました。写真を撮り直すか、もう一度押してください")
 
 
 def ocr_screen(image_bytes: bytes, api_key: str, model: str = "gpt-4o") -> dict:
     """画像1枚 -> パース済みdict（half, hole_numbers, hole_pars, players[...]）。
     api_key は呼び出し側が用意（名刺アプリと同じ読み方）。既定モデルは gpt-4o。"""
     raw = _call_vision(image_bytes, api_key, model=model)
-    return parse_vision_json(raw)
+    try:
+        return parse_vision_json(raw)
+    except ValueError:
+        raise RuntimeError("AI の返事を表として読めませんでした。写真を撮り直すか、もう一度押してください"
+                           f"（返事の先頭: {raw[:80]!r}）")
